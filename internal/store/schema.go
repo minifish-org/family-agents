@@ -19,6 +19,13 @@ func EnsureSchema(app core.App) error {
 		}
 	}
 	if existing, findErr := app.FindCollectionByNameOrId("agents"); findErr == nil {
+		apiField := existing.Fields.GetByName("model_api").(*core.SelectField)
+		if len(apiField.Values) != len(domain.ModelAPIs()) {
+			apiField.Values = domain.ModelAPIs()
+			if err = app.Save(existing); err != nil {
+				return err
+			}
+		}
 		if existing.Fields.GetByName("model_connection") == nil {
 			existing.Fields.Add(&core.TextField{Name: "model_connection", Max: 80})
 			return app.Save(existing)
@@ -34,7 +41,7 @@ func EnsureSchema(app core.App) error {
 		&core.TextField{Name: "system_prompt", Required: true, Max: 64000},
 		&core.TextField{Name: "model", Required: true, Max: 255},
 		&core.TextField{Name: "model_url", Required: true, Max: 2048},
-		&core.SelectField{Name: "model_api", Required: true, MaxSelect: 1, Values: []string{"openai-completions", "openai-responses", "anthropic-messages"}},
+		&core.SelectField{Name: "model_api", Required: true, MaxSelect: 1, Values: domain.ModelAPIs()},
 		&core.NumberField{Name: "context_window", Required: true, OnlyInt: true},
 		&core.NumberField{Name: "max_tokens", Required: true, OnlyInt: true},
 		&core.BoolField{Name: "auto_start"}, &core.BoolField{Name: "auto_reset"},

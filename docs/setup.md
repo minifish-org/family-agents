@@ -4,7 +4,7 @@ Pith Post manages one Matrix server, people, and their agents. Conversations hap
 
 ## Operator preparation
 
-Build the single binary, preserve its external master key, and provision an administrator as described in README. Model/runtime configuration is an operator concern; preserve the existing shared model connection or provision it through the authenticated connections API. The product does not expose model or infrastructure dashboards.
+Build the single binary, preserve its external master key, and provision an administrator as described in README. In **Settings → Model**, choose a provider, enter its API key, choose a model from the Pith catalog and select a supported thinking strength. This single selection applies to all agents from their next reply. Previously configured services and keys remain available; compatible custom services also show their service address. There are no per-agent model choices or advanced model controls.
 
 Create dedicated Matrix accounts on the one homeserver before adding agents. Never share a person's own login or a bot account between services. Run only one Pith Post instance against a given data directory and set of bot identities.
 
@@ -23,6 +23,6 @@ To connect an existing assistant, reuse its original account and data. A profile
 
 The configured person can invite the bot to a private DM. Only owner-initiated, verified two-person rooms qualify; pending work retains its original destination. Encryption is enabled before content is processed or sent. If the bot lacks permission to enable it, the room creator must enable encryption. Resend an initial plaintext message after encryption is active. Groups and strangers are excluded.
 
-First initialization, backup, forgotten-password recovery and runtime-model setup are operator tasks. The advanced PocketBase UI remains available at `/_/`; ordinary product configuration uses the People/Settings interface.
+First initialization, backup and forgotten-password recovery are operator tasks. The advanced PocketBase UI remains available at `/_/`; ordinary product configuration uses the People/Settings interface.
 
 People have no manually maintained name in Pith Post. Names and avatars are refreshed from the configured Matrix server with a short cache. Images appear next to the person in their card, details and agent owner summary; no separate image configuration is needed. A failed image fetch keeps the last cached image; removing an avatar in Matrix clears it locally. People without an image use an initial. A failed lookup preserves the last known name; accounts without a display name use their Matrix ID. Click a person’s name to view their Matrix ID or remove the person after their agents are removed. There is no separate name-edit or manual-refresh step. This is read-only and never changes the person’s Matrix profile or agent ownership.

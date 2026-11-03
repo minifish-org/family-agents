@@ -45,9 +45,26 @@ func (m Model) Generate(ctx context.Context, c domain.Config, path, workspace, i
 		key = "local-no-key"
 	} // Do not fall back to ambient provider credentials.
 	model := &aitypes.Model{Id: c.Model, Name: c.Model, Api: aitypes.Api(c.ModelAPI), Provider: aitypes.ProviderId("pith-post"), BaseUrl: c.ModelURL, Input: []aitypes.ModelInputModality{aitypes.ModelInputText}, MaxTokens: float64(c.MaxTokens), ContextWindow: float64(c.ContextWindow)}
+	if c.ModelProvider != "" && CustomAPI(c.ModelProvider) == "" {
+		known := Catalog().GetModel(c.ModelProvider, c.Model)
+		if known == nil {
+			return nil, errors.New("selected Pith model is unavailable")
+		}
+		copy := *known
+		model = &copy
+		model.BaseUrl = c.ModelURL
+	}
+	thinking := agenttypes.ThinkingLevel(agenttypes.ThinkingOff)
+	if c.Thinking != "" {
+		thinking = agenttypes.ThinkingLevel(c.Thinking)
+	}
+	if thinking != agenttypes.ThinkingOff {
+		model.Reasoning = true
+	}
+
 	session, err := codingagent.CreateAgentSessionFromServices(codingagent.CreateAgentSessionFromServicesOptions{
 		Services: codingagent.AgentSessionServices{Cwd: workspace, Manager: manager, Tools: tools, Resources: codingagent.ResourceSet{SystemPrompt: c.Prompt + "\n" + deliveryInstructions}},
-		Model:    codingagent.ModelOptions{Model: model, ThinkingLevel: agenttypes.ThinkingOff, APIKey: func(context.Context, string) (string, error) { return key, nil }, StreamFn: m.Stream},
+		Model:    codingagent.ModelOptions{Model: model, ThinkingLevel: thinking, APIKey: func(context.Context, string) (string, error) { return key, nil }, StreamFn: m.Stream},
 		// The pinned SDK treats reaching MaxTurns as an error, even on a final answer.
 		Policy: codingagent.RunPolicy{MaxTurns: 2, RetryAttempts: 0},
 	})

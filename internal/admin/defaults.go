@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/minifish-org/pith-post/internal/domain"
+	"github.com/minifish-org/pith-post/internal/store"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -56,6 +57,13 @@ func setupDefaults(app core.App) (SetupDefaults, error) {
 		if len(connections) > 0 {
 			defaults.Connection = connections[0].ID
 		}
+	}
+	selected, err := store.GlobalConnection(app)
+	if err != nil {
+		return defaults, err
+	}
+	if selected != "" {
+		defaults.Connection = selected
 	}
 	return defaults, nil
 }

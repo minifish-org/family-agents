@@ -178,6 +178,13 @@ func ConfigFromRecord(app core.App, r *core.Record) (domain.Config, error) {
 	}
 	c := domain.Config{ID: r.Id, Name: r.GetString("name"), Owner: owner.GetString("mxid"), Bot: r.GetString("bot_mxid"), Homeserver: r.GetString("homeserver"), Prompt: r.GetString("system_prompt"), Model: r.GetString("model"), ModelURL: r.GetString("model_url"), ModelAPI: r.GetString("model_api"), ContextWindow: r.GetInt("context_window"), MaxTokens: r.GetInt("max_tokens"), AutoStart: r.GetBool("auto_start"), AutoReset: r.GetBool("auto_reset")}
 	c.OwnerID, c.OwnerName, c.Connection = owner.Id, owner.GetString("name"), r.GetString("model_connection")
+	selected, err := GlobalConnection(app)
+	if err != nil {
+		return c, err
+	}
+	if selected != "" {
+		c.Connection = selected
+	}
 	if c.Connection != "" {
 		connection, err := readConnection(app, c.Connection)
 		if err != nil {

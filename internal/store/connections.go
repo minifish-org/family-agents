@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -19,11 +20,14 @@ type Connection struct {
 	Context   int    `json:"context_window"`
 	MaxTokens int    `json:"max_tokens"`
 	KeySet    bool   `json:"key_set"`
+	Provider  string `json:"provider,omitempty"`
+	Thinking  string `json:"thinking,omitempty"`
 }
 
 func (c Connection) Apply(config *domain.Config) {
 	config.Model, config.ModelURL, config.ModelAPI = c.Model, c.URL, c.API
 	config.ContextWindow, config.MaxTokens = c.Context, c.MaxTokens
+	config.ModelProvider, config.Thinking = c.Provider, c.Thinking
 }
 
 func (c Connection) Validate() error {
@@ -39,7 +43,7 @@ func (c Connection) Validate() error {
 	if strings.TrimSpace(c.Model) == "" || len(c.Model) > 255 {
 		return errors.New("a model ID is required")
 	}
-	if c.API != "openai-completions" && c.API != "openai-responses" && c.API != "anthropic-messages" {
+	if !domain.ValidModelAPI(c.API) {
 		return errors.New("choose a supported API format")
 	}
 	if c.MaxTokens < 1 || c.Context < c.MaxTokens {
@@ -189,4 +193,31 @@ func (s *Store) Counts(id string) (Counts, error) {
 	var result Counts
 	err := s.App.DB().NewQuery(`SELECT (SELECT count(*) FROM post_runs WHERE agent={:a} AND status='queued') AS queued,(SELECT count(*) FROM post_runs WHERE agent={:a} AND status='running') AS running,(SELECT count(*) FROM post_runs WHERE agent={:a} AND status='interrupted') AS interrupted,(SELECT count(*) FROM post_outbox WHERE agent={:a} AND sent=0) AS pending`).Bind(dbx.Params{"a": id}).One(&result)
 	return result, err
+}
+
+// A selected global model applies to every agent without rewriting their identities or legacy settings.
+func GlobalConnection(app core.App) (string, error) {
+	var raw string
+	err := app.DB().NewQuery(`SELECT value FROM post_settings WHERE name='model'`).Row(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var selected struct {
+		Connection string `json:"connection"`
+	}
+	if err = json.Unmarshal([]byte(raw), &selected); err != nil {
+		return "", err
+	}
+	return selected.Connection, nil
+}
+func (s *Store) SelectGlobalConnection(id string) error {
+	if _, err := s.Connection(id); err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(map[string]string{"connection": id})
+	_, err := s.App.DB().NewQuery(`INSERT INTO post_settings(name,value) VALUES('model',{:v}) ON CONFLICT(name) DO UPDATE SET value=excluded.value`).Bind(dbx.Params{"v": string(raw)}).Execute()
+	return err
 }

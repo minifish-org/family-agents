@@ -272,6 +272,13 @@ func (a Admin) saveConnection(e *core.RequestEvent) error {
 func (a Admin) deleteConnection(e *core.RequestEvent) error {
 	id := e.Request.PathValue("id")
 	err := e.App.RunInTransaction(func(app core.App) error {
+		selected, err := store.GlobalConnection(app)
+		if err != nil {
+			return err
+		}
+		if selected == id {
+			return errors.New("selected global provider cannot be removed")
+		}
 		var count int
 		if err := app.DB().NewQuery(`SELECT count(*) FROM agents WHERE model_connection={:id}`).Bind(dbx.Params{"id": id}).Row(&count); err != nil {
 			return err
@@ -279,7 +286,7 @@ func (a Admin) deleteConnection(e *core.RequestEvent) error {
 		if count > 0 {
 			return errors.New("connection still used")
 		}
-		_, err := app.DB().NewQuery(`DELETE FROM post_connections WHERE id={:id}`).Bind(dbx.Params{"id": id}).Execute()
+		_, err = app.DB().NewQuery(`DELETE FROM post_connections WHERE id={:id}`).Bind(dbx.Params{"id": id}).Execute()
 		return err
 	})
 	if err != nil {

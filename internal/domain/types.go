@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	aitypes "github.com/minifish-org/pith/packages/ai/types"
 	"net/url"
 	"regexp"
 	"strings"
@@ -42,6 +43,8 @@ type Config struct {
 	Model         string `json:"model"`
 	ModelURL      string `json:"model_url"`
 	ModelAPI      string `json:"model_api"`
+	ModelProvider string `json:"model_provider,omitempty"`
+	Thinking      string `json:"thinking,omitempty"`
 	ContextWindow int    `json:"context_window"`
 	MaxTokens     int    `json:"max_tokens"`
 	AutoStart     bool   `json:"auto_start"`
@@ -62,7 +65,7 @@ func (c Config) Validate() error {
 	if c.Name == "" || c.Model == "" || strings.TrimSpace(c.Prompt) == "" {
 		return errors.New("name, model, and system prompt are required")
 	}
-	if c.ModelAPI != "openai-completions" && c.ModelAPI != "openai-responses" && c.ModelAPI != "anthropic-messages" {
+	if !ValidModelAPI(c.ModelAPI) {
 		return errors.New("unsupported model API")
 	}
 	if c.MaxTokens < 1 || c.ContextWindow < c.MaxTokens {
@@ -232,4 +235,16 @@ func CheckID(s string) error {
 		return fmt.Errorf("invalid internal identifier")
 	}
 	return nil
+}
+
+func ModelAPIs() []string {
+	return []string{string(aitypes.ApiOpenAICompletions), string(aitypes.ApiOpenAIResponses), string(aitypes.ApiOpenAICodexResponses), string(aitypes.ApiAzureOpenAIResponses), string(aitypes.ApiAnthropicMessages), string(aitypes.ApiGoogleGenerativeAI), string(aitypes.ApiGoogleVertex), string(aitypes.ApiMistralConversations), string(aitypes.ApiBedrockConverseStream), string(aitypes.ApiPiMessages)}
+}
+func ValidModelAPI(api string) bool {
+	for _, supported := range ModelAPIs() {
+		if api == supported {
+			return true
+		}
+	}
+	return false
 }

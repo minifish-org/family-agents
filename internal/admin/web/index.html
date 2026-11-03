@@ -1,13 +1,4 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pith Post</title><link rel="stylesheet" href="/post/style.css"><script defer src="/post/app.js"></script></head>
-<body>
-<header><div><span class="mark">P</span><h1>Pith Post</h1><p>Private agents. Familiar conversations.</p></div><nav><a href="/_/">Configuration dashboard</a><button id="refresh" hidden>Refresh</button><button id="logout" hidden>Sign out</button></nav></header>
-<main>
-<section id="login"><h2>Administrator sign in</h2><p>Use your PocketBase superuser account. Your token stays in this tab's memory.</p><form id="login-form"><label>Email<input name="identity" type="email" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Sign in</button></form></section>
-<p id="notice" role="status" aria-live="polite"></p>
-<section id="agents"></section>
-<section id="history" hidden><h2>Recent history</h2><p>Last 100 runs and deliveries. Binary content is omitted. Stop the agent before reviewing interrupted work.</p><pre id="history-content"></pre></section>
-<dialog id="credentials"><form id="credential-form"><h2>Replace credentials</h2><p>The agent must be stopped. Blank fields keep existing values. Tokens must belong to the original Matrix device. Secrets are never displayed again.</p><label>Bot password<input name="password" type="password" autocomplete="new-password"></label><label>Matrix access token<input name="access_token" type="password" autocomplete="off"></label><label>Model API key<input name="model_key" type="password" autocomplete="off"></label><button type="submit">Save encrypted credentials</button><button type="button" id="cancel-credentials">Cancel</button></form></dialog>
-</main><footer>Pith Post · AGPL-3.0 · No warranty. <a href="https://github.com/minifish-org/pith-post">Source code</a>. Operators must offer the source of their deployed version.</footer>
-</body></html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Pith Post</title><link rel="icon" type="image/svg+xml" href="/post/favicon.svg"><link rel="stylesheet" href="/post/style.css"><script defer src="/post/app.js"></script></head>
+<body><div id="app"><header class="topbar" id="topbar" hidden><div class="topbar-inner"><button class="brand" type="button" data-view="people"><span class="brand-mark" aria-hidden="true">p</span>Pith Post</button><nav aria-label="Main navigation"><button type="button" data-view="people">People</button><button type="button" data-view="settings">Settings</button></nav></div></header><div id="connection-banner" class="banner" role="status" hidden></div><main id="main" aria-busy="true"><p>Opening Pith Post…</p></main><p id="live" class="sr" aria-live="polite" role="status"></p><dialog id="editor" aria-labelledby="editor-title"></dialog><dialog id="confirm-dialog" aria-labelledby="confirm-title"></dialog></div></body></html>

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minifish-org/pith-post/internal/domain"
@@ -14,6 +15,9 @@ import (
 )
 
 type worker struct {
+	reconnect atomic.Bool
+	admission sync.Mutex
+	draining  atomic.Bool
 	cancel    context.CancelFunc
 	done      chan struct{}
 	wake      chan struct{}
@@ -21,19 +25,24 @@ type worker struct {
 	ctx       context.Context
 }
 type slot struct {
-	mu     sync.Mutex
-	worker *worker
+	runtime  atomic.Pointer[worker]
+	starting atomic.Bool
+	mu       sync.Mutex
+	worker   *worker
 }
 type Manager struct {
-	Store    *store.Store
-	Model    domain.Model
-	Open     domain.Factory
-	Reset    func(context.Context, domain.Config, string) error
-	Interval time.Duration
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	slots    map[string]*slot
+	backgroundMu sync.Mutex
+	background   sync.WaitGroup
+	closing      bool
+	Store        *store.Store
+	Model        domain.Model
+	Open         domain.Factory
+	Reset        func(context.Context, domain.Config, string) error
+	Interval     time.Duration
+	ctx          context.Context
+	cancel       context.CancelFunc
+	mu           sync.Mutex
+	slots        map[string]*slot
 }
 
 func New(s *store.Store, model domain.Model, open domain.Factory) *Manager {
@@ -59,11 +68,46 @@ func alive(w *worker) bool {
 		return true
 	}
 }
-func (m *Manager) Running(id string) bool {
+func (m *Manager) Running(id string) bool { return alive(m.slot(id).runtime.Load()) }
+func (m *Manager) Draining(id string) bool {
+	w := m.slot(id).runtime.Load()
+	return alive(w) && w.draining.Load()
+}
+func (m *Manager) Starting(id string) bool { return m.slot(id).starting.Load() }
+
+// SetEnabled persists desired availability. Normal disabling lets the current turn finish.
+// Admission and the running transition share a lock so no new turn can start after disabling.
+func (m *Manager) SetEnabled(id string, enabled bool) error {
 	s := m.slot(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return alive(s.worker)
+	if enabled && alive(s.worker) && s.worker.draining.Load() {
+		return errors.New("wait for the current reply to finish before enabling")
+	}
+	r, err := m.Store.App.FindRecordById("agents", id)
+	if err != nil {
+		return err
+	}
+	if alive(s.worker) {
+		s.worker.admission.Lock()
+		defer s.worker.admission.Unlock()
+	}
+	r.Set("auto_start", enabled)
+	if err = m.Store.App.Save(r); err != nil {
+		return err
+	}
+	if alive(s.worker) {
+		if !enabled {
+			s.worker.reconnect.Store(false)
+		}
+		s.worker.draining.Store(!enabled)
+		wake(s.worker)
+		return nil
+	}
+	if enabled {
+		return m.startLocked(id, s)
+	}
+	return nil
 }
 func (m *Manager) Start(id string) error {
 	s := m.slot(id)
@@ -85,6 +129,8 @@ func (m *Manager) startLocked(id string, s *slot) error {
 	if err = m.Store.RecoverAgent(id); err != nil {
 		return err
 	}
+	s.starting.Store(true)
+	defer s.starting.Store(false)
 	ctx, cancel := context.WithCancel(m.ctx)
 	initCtx, initCancel := context.WithTimeout(ctx, 90*time.Second)
 	transport, err := m.Open(initCtx, c)
@@ -111,6 +157,7 @@ func (m *Manager) startLocked(id string, s *slot) error {
 	}
 	w := &worker{ctx: ctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1), transport: transport}
 	s.worker = w
+	s.runtime.Store(w)
 	go m.run(c, w)
 	return nil
 }
@@ -126,6 +173,7 @@ func (m *Manager) stopLocked(s *slot) {
 		s.worker.cancel()
 		<-s.worker.done
 		s.worker = nil
+		s.runtime.Store(nil)
 	}
 }
 func (m *Manager) Restart(id string) error {
@@ -136,7 +184,10 @@ func (m *Manager) Restart(id string) error {
 	return m.startLocked(id, s)
 }
 func (m *Manager) Close() {
+	m.backgroundMu.Lock()
+	m.closing = true
 	m.cancel()
+	m.backgroundMu.Unlock()
 	m.mu.Lock()
 	slots := make([]*slot, 0, len(m.slots))
 	for _, s := range m.slots {
@@ -149,7 +200,31 @@ func (m *Manager) Close() {
 		go func() { defer wg.Done(); s.mu.Lock(); defer s.mu.Unlock(); m.stopLocked(s) }()
 	}
 	wg.Wait()
+	m.background.Wait()
 }
+
+// Background jobs share the manager lifetime and finish before its stores are closed.
+func (m *Manager) Background(fn func(context.Context)) {
+	m.backgroundMu.Lock()
+	if m.closing {
+		m.backgroundMu.Unlock()
+		return
+	}
+	m.background.Add(1)
+	m.backgroundMu.Unlock()
+	go func() { defer m.background.Done(); fn(m.ctx) }()
+}
+
+// StopAndApply serializes an explicit removal with starts and running turns.
+// The callback must retain private history; unfinished work must never be replayed implicitly.
+func (m *Manager) StopAndApply(id string, fn func() error) error {
+	s := m.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.stopLocked(s)
+	return fn()
+}
+
 func (m *Manager) WithStopped(id string, fn func() error) error {
 	s := m.slot(id)
 	s.mu.Lock()
@@ -188,6 +263,9 @@ func (m *Manager) check(ctx context.Context, c domain.Config, t domain.Transport
 	}
 	snapshot, err := t.Snapshot(ctx)
 	if err == nil {
+		if state.AwaitingOwner && domain.InitialInvitation(c, state.Room, snapshot) {
+			return domain.ErrAwaitingOwner
+		}
 		err = domain.OwnerOnly(c, state.Room, snapshot)
 	}
 	if err != nil {
@@ -198,6 +276,9 @@ func (m *Manager) check(ctx context.Context, c domain.Config, t domain.Transport
 			return e
 		}
 		return domain.ErrPaused
+	}
+	if state.AwaitingOwner {
+		return m.Store.UpdateState(c.ID, func(s *domain.State) error { s.AwaitingOwner = false; return nil })
 	}
 	return nil
 }
@@ -247,7 +328,7 @@ func (m *Manager) Trigger(id, key, prompt string) (string, error) {
 	s := m.slot(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !alive(s.worker) {
+	if !alive(s.worker) || s.worker.draining.Load() {
 		return "", domain.ErrStopped
 	}
 	c, err := m.Store.Config(id)
@@ -273,7 +354,7 @@ func (m *Manager) admit(ctx context.Context, c domain.Config, w *worker, in doma
 	if !in.Decrypted || in.EventID == "" || !strings.HasPrefix(in.EventID, "$") || in.Room != state.Room || in.Sender != c.Owner || in.Sender == c.Bot || strings.TrimSpace(in.Text) == "" || len(in.Text) > domain.MaxText {
 		return nil
 	}
-	if err = m.check(ctx, c, w.transport, false); errors.Is(err, domain.ErrPaused) {
+	if err = m.check(ctx, c, w.transport, false); errors.Is(err, domain.ErrPaused) || errors.Is(err, domain.ErrAwaitingOwner) {
 		return nil
 	} else if err != nil {
 		return err
@@ -285,19 +366,38 @@ func (m *Manager) admit(ctx context.Context, c domain.Config, w *worker, in doma
 	return err
 }
 func (m *Manager) run(c domain.Config, w *worker) {
-	defer close(w.done)
+	defer func() {
+		close(w.done)
+		if w.reconnect.Load() {
+			go func() {
+				s := m.slot(c.ID)
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if s.worker == w && m.ctx.Err() == nil {
+					_ = m.startLocked(c.ID, s)
+				}
+			}()
+		}
+	}()
 	defer w.transport.Close()
 	syncDone := make(chan struct{})
 	go func() {
 		defer close(syncDone)
 		err := w.transport.Run(w.ctx, func(in domain.Inbound) error { return m.admit(w.ctx, c, w, in) }, func() error {
 			err := m.check(w.ctx, c, w.transport, true)
-			if errors.Is(err, domain.ErrPaused) {
+			if errors.Is(err, domain.ErrPaused) || errors.Is(err, domain.ErrAwaitingOwner) {
 				return nil
 			}
 			return err
 		})
-		if err != nil && w.ctx.Err() == nil {
+		if errors.Is(err, domain.ErrChatRequested) {
+			w.admission.Lock()
+			w.reconnect.Store(true)
+			w.draining.Store(true)
+			w.admission.Unlock()
+			wake(w)
+			return
+		} else if err != nil && w.ctx.Err() == nil {
 			_ = m.Store.UpdateState(c.ID, func(s *domain.State) error { s.LastError = "Matrix sync stopped; restart the agent"; return nil })
 		}
 		w.cancel()
@@ -309,8 +409,15 @@ func (m *Manager) run(c domain.Config, w *worker) {
 		if w.ctx.Err() != nil {
 			return
 		}
-		err := m.step(w.ctx, c, w.transport)
-		if err != nil && !errors.Is(err, domain.ErrPaused) && !errors.Is(err, domain.ErrReview) && w.ctx.Err() == nil {
+		if w.draining.Load() {
+			_ = m.deliver(w.ctx, c, w.transport)
+			return
+		}
+		err := m.stepWorker(w.ctx, c, w.transport, w)
+		if w.draining.Load() {
+			return
+		}
+		if err != nil && !errors.Is(err, domain.ErrPaused) && !errors.Is(err, domain.ErrReview) && !errors.Is(err, domain.ErrAwaitingOwner) && w.ctx.Err() == nil {
 			// Never log SDK/provider/HTTP errors, which may contain request bodies or credentials.
 			_ = m.Store.UpdateState(c.ID, func(s *domain.State) error {
 				s.LastError = "Execution or delivery failed; inspect history and retry or review"
@@ -326,6 +433,9 @@ func (m *Manager) run(c domain.Config, w *worker) {
 	}
 }
 func (m *Manager) step(ctx context.Context, c domain.Config, t domain.Transport) error {
+	return m.stepWorker(ctx, c, t, nil)
+}
+func (m *Manager) stepWorker(ctx context.Context, c domain.Config, t domain.Transport, w *worker) error {
 	if err := m.deliver(ctx, c, t); err != nil {
 		return err
 	}
@@ -344,7 +454,7 @@ func (m *Manager) step(ctx context.Context, c domain.Config, t domain.Transport)
 		return err
 	}
 	// Fresh configuration on every turn applies prompt/model edits without a Matrix login.
-	current, err := m.Store.Config(c.ID)
+	current, modelKey, err := m.Store.GenerationConfig(c.ID)
 	if err != nil {
 		return err
 	}
@@ -356,15 +466,22 @@ func (m *Manager) step(ctx context.Context, c domain.Config, t domain.Transport)
 	if err != nil {
 		return err
 	}
-	secrets, err := m.Store.Secrets(c.ID)
+	if w != nil {
+		w.admission.Lock()
+		if w.draining.Load() {
+			w.admission.Unlock()
+			return nil
+		}
+	}
+	err = m.Store.SetRun(r.ID, "running", "")
+	if w != nil {
+		w.admission.Unlock()
+	}
 	if err != nil {
 		return err
 	}
-	if err = m.Store.SetRun(r.ID, "running", ""); err != nil {
-		return err
-	}
 	turnCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	contents, err := m.Model.Generate(turnCtx, current, session, workspace, r.Input, secrets.ModelKey)
+	contents, err := m.Model.Generate(turnCtx, current, session, workspace, r.Input, modelKey)
 	cancel()
 	if err != nil {
 		if e := m.Store.SetRun(r.ID, "interrupted", "Execution did not complete; administrator review required before replay"); e != nil {

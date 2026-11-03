@@ -15,7 +15,11 @@ var (
 	ErrReview         = errors.New("an interrupted run requires administrator review")
 	ErrStopped        = errors.New("agent is stopped")
 	ErrCryptoRecovery = errors.New("original Matrix identity requires recovery")
+	ErrAwaitingOwner  = errors.New("waiting for the owner to accept the private invitation")
+	ErrChatRequested  = errors.New("the owner requested a new private chat")
 )
+
+const TimelineGapHold = "Matrix timeline gap; review history and ask the owner to resend missing requests before resuming"
 
 const MaxAttachment = 8 << 20
 const MaxText = 24000
@@ -29,6 +33,9 @@ type Config struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	Owner         string `json:"owner"`
+	OwnerID       string `json:"owner_id"`
+	OwnerName     string `json:"owner_name"`
+	Connection    string `json:"connection"`
 	Bot           string `json:"bot"`
 	Homeserver    string `json:"homeserver"`
 	Prompt        string `json:"prompt"`
@@ -66,16 +73,26 @@ func (c Config) Validate() error {
 
 // Secrets are only serialized inside the authenticated encryption envelope.
 type Secrets struct {
-	Password    string `json:"password,omitempty"`
-	AccessToken string `json:"access_token,omitempty"`
-	ModelKey    string `json:"model_key,omitempty"`
-	PickleKey   []byte `json:"pickle_key"`
+	CrossSigning []byte `json:"cross_signing,omitempty"`
+	Password     string `json:"password,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
+	ModelKey     string `json:"model_key,omitempty"`
+	PickleKey    []byte `json:"pickle_key"`
 }
 
 type State struct {
+	DeviceVerified     bool   `json:"device_verified,omitempty"`
+	VerificationError  string `json:"verification_error,omitempty"`
+	SyncFilterID       string `json:"sync_filter_id,omitempty"`
+	SyncFilterAll      bool   `json:"sync_filter_all,omitempty"`
+	SyncWarning        string `json:"sync_warning,omitempty"`
+	ChatSyncPending    bool   `json:"chat_sync_pending,omitempty"`
+	ChatConnectedAt    int64  `json:"chat_connected_at,omitempty"`
+	RequestedRoom      string `json:"requested_room,omitempty"`
 	Device             string `json:"device"`
 	Room               string `json:"room"`
 	RoomCreating       bool   `json:"room_creating"`
+	AwaitingOwner      bool   `json:"awaiting_owner"`
 	CryptoReady        bool   `json:"crypto_ready"`
 	Generation         int    `json:"generation"`
 	Conversation       int    `json:"conversation"`
@@ -163,6 +180,38 @@ func OwnerOnly(c Config, room string, s Snapshot) error {
 		return ErrPaused
 	}
 	return nil
+}
+
+// InitialInvitation is deliberately narrower than an ordinary membership hold.
+// Only a newly created encrypted room with the original owner's invitation qualifies.
+func InitialInvitation(c Config, room string, s Snapshot) bool {
+	if room == "" || room != s.Room || !s.Encrypted {
+		return false
+	}
+	owner, bot := false, false
+	seen := map[string]bool{}
+	for _, m := range s.Members {
+		if seen[m.MXID] {
+			return false
+		}
+		seen[m.MXID] = true
+		if m.MXID == c.Owner {
+			owner = m.Membership == "invite"
+		}
+		if m.MXID == c.Bot {
+			bot = m.Membership == "join"
+		}
+		switch m.Membership {
+		case "join", "invite", "knock":
+			if m.MXID != c.Owner && m.MXID != c.Bot {
+				return false
+			}
+		case "leave", "ban":
+		default:
+			return false
+		}
+	}
+	return owner && bot
 }
 
 type Transport interface {

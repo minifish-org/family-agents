@@ -21,19 +21,21 @@ import (
 )
 
 type matrixServer struct {
-	mu        sync.Mutex
-	c         domain.Config
-	device    string
-	keys      json.RawMessage
-	upload    []byte
-	created   map[string]any
-	events    map[string][]byte
-	sendCalls int
-	logins    int
-	unsafe    bool
-	failAck   bool
-	syncEvent *event.Event
-	syncCount int
+	mu            sync.Mutex
+	c             domain.Config
+	device        string
+	keys          json.RawMessage
+	upload        []byte
+	created       map[string]any
+	events        map[string][]byte
+	sendCalls     int
+	logins        int
+	unsafe        bool
+	failAck       bool
+	syncEvent     *event.Event
+	syncCount     int
+	syncLimited   bool
+	filterCreates int
 }
 
 func (s *matrixServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -43,6 +45,7 @@ func (s *matrixServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reply := func(v any) { _ = json.NewEncoder(w).Encode(v) }
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/filter"):
+		s.filterCreates++
 		reply(map[string]any{"filter_id": "test-filter"})
 	case strings.HasSuffix(r.URL.Path, "/sync"):
 		s.syncCount++
@@ -51,7 +54,7 @@ func (s *matrixServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reply(map[string]any{"errcode": "M_UNKNOWN_TOKEN", "error": "End of test sync"})
 			return
 		}
-		reply(map[string]any{"next_batch": "test-batch-1", "device_one_time_keys_count": map[string]int{"signed_curve25519": 50}, "rooms": map[string]any{"join": map[string]any{string(s.syncEvent.RoomID): map[string]any{"timeline": map[string]any{"events": []*event.Event{s.syncEvent}, "limited": false}}}}})
+		reply(map[string]any{"next_batch": "test-batch-1", "device_one_time_keys_count": map[string]int{"signed_curve25519": 50}, "rooms": map[string]any{"join": map[string]any{string(s.syncEvent.RoomID): map[string]any{"timeline": map[string]any{"events": []*event.Event{s.syncEvent}, "limited": s.syncLimited}}}}})
 	case strings.HasSuffix(r.URL.Path, "/login"):
 		var req mautrix.ReqLogin
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -235,6 +238,11 @@ func TestInboundAdapterRejectsPlaintextUnknownKeysEditsAndOtherRooms(t *testing.
 	if _, ok := AcceptEvent(c, string(good.RoomID), &good); !ok {
 		t.Fatal("valid owner event was rejected")
 	}
+	mention := good
+	mention.Content = event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "Hi assistant", Mentions: &event.Mentions{UserIDs: []id.UserID{id.UserID(c.Bot)}}}}
+	if _, ok := AcceptEvent(c, string(good.RoomID), &mention); !ok {
+		t.Fatal("owner mention in a private message was rejected")
+	}
 	for _, test := range []struct {
 		name   string
 		change func(*event.Event)
@@ -245,9 +253,6 @@ func TestInboundAdapterRejectsPlaintextUnknownKeysEditsAndOtherRooms(t *testing.
 		{"other-room", func(e *event.Event) { e.RoomID = "!other:example.test" }},
 		{"non-owner", func(e *event.Event) { e.Sender = "@other:example.test" }},
 		{"bot-event", func(e *event.Event) { e.Sender = id.UserID(c.Bot) }},
-		{"mention", func(e *event.Event) {
-			e.Content = event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "Mention", Mentions: &event.Mentions{UserIDs: []id.UserID{id.UserID(c.Bot)}}}}
-		}},
 		{"edit", func(e *event.Event) {
 			e.Content = event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "Edit", NewContent: &event.MessageEventContent{Body: "replacement"}}}
 		}},

@@ -23,10 +23,11 @@ import (
 )
 
 type Store struct {
-	App   core.App
-	Root  string
-	vault cipher.AEAD
-	mu    sync.Mutex
+	App          core.App
+	Root         string
+	vault        cipher.AEAD
+	mu           sync.Mutex
+	profileLocks sync.Map
 }
 
 func New(app core.App, key string) (*Store, error) {
@@ -62,6 +63,17 @@ func (s *Store) Init() error {
 		`CREATE INDEX IF NOT EXISTS post_runs_pending ON post_runs(agent,status,created)`,
 		`CREATE INDEX IF NOT EXISTS post_outbox_pending ON post_outbox(agent,sent)`,
 		`CREATE TABLE IF NOT EXISTS post_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, created INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS post_connections (id TEXT PRIMARY KEY, value TEXT NOT NULL, secret BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS post_ui (admin TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(admin,name))`,
+		`CREATE TABLE IF NOT EXISTS post_sessions (id TEXT PRIMARY KEY, admin TEXT NOT NULL, auth_key TEXT NOT NULL, csrf TEXT NOT NULL, expires INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS post_setup_requests (admin TEXT NOT NULL, request TEXT NOT NULL, agent TEXT NOT NULL, PRIMARY KEY(admin,request))`,
+		`CREATE TABLE IF NOT EXISTS post_discarded (id TEXT PRIMARY KEY, created INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS post_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS post_person_avatars (person TEXT PRIMARY KEY, avatar BLOB, avatar_hash TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS post_person_profiles (person TEXT PRIMARY KEY, checked INTEGER NOT NULL, failed INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS post_agent_profiles (agent TEXT PRIMARY KEY, avatar BLOB, avatar_hash TEXT NOT NULL DEFAULT '', applied_name TEXT NOT NULL DEFAULT '', applied_hash TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '')`,
+		// Older versions marked discarded deliveries as sent and recorded the distinction in audit.
+		`INSERT OR IGNORE INTO post_discarded(id,created) SELECT o.id,min(a.created) FROM post_outbox o JOIN post_audit a ON a.agent=o.agent AND a.action='discard-delivery' AND substr(a.reason,1,length(o.id)+2)=o.id||': ' WHERE o.sent=1 GROUP BY o.id`,
 	} {
 		if _, err := s.App.DB().NewQuery(query).Execute(); err != nil {
 			return err
@@ -69,7 +81,10 @@ func (s *Store) Init() error {
 	}
 	// The process lock is held before bootstrap. Any running row belongs to a previous process.
 	_, err := s.App.DB().NewQuery(`UPDATE post_runs SET status='interrupted', error='Execution interrupted; review before replay' WHERE status='running'`).Execute()
-	return err
+	if err != nil {
+		return err
+	}
+	return s.MigrateConnections()
 }
 
 func (s *Store) seal(agent string, raw []byte) []byte {
@@ -162,6 +177,14 @@ func ConfigFromRecord(app core.App, r *core.Record) (domain.Config, error) {
 		return domain.Config{}, errors.New("owner record not found")
 	}
 	c := domain.Config{ID: r.Id, Name: r.GetString("name"), Owner: owner.GetString("mxid"), Bot: r.GetString("bot_mxid"), Homeserver: r.GetString("homeserver"), Prompt: r.GetString("system_prompt"), Model: r.GetString("model"), ModelURL: r.GetString("model_url"), ModelAPI: r.GetString("model_api"), ContextWindow: r.GetInt("context_window"), MaxTokens: r.GetInt("max_tokens"), AutoStart: r.GetBool("auto_start"), AutoReset: r.GetBool("auto_reset")}
+	c.OwnerID, c.OwnerName, c.Connection = owner.Id, owner.GetString("name"), r.GetString("model_connection")
+	if c.Connection != "" {
+		connection, err := readConnection(app, c.Connection)
+		if err != nil {
+			return c, errors.New("model connection is unavailable")
+		}
+		connection.Apply(&c)
+	}
 	return c, c.Validate()
 }
 func (s *Store) Configs() ([]domain.Config, error) {
@@ -205,13 +228,15 @@ type Run struct {
 	Error   string `db:"error" json:"error"`
 }
 type Outbox struct {
-	ID      string `db:"id" json:"id"`
-	Agent   string `db:"agent" json:"agent"`
-	Run     string `db:"run" json:"run"`
-	Ordinal int    `db:"ordinal" json:"ordinal"`
-	Content string `db:"content" json:"content"`
-	Wire    []byte `db:"wire" json:"-"`
-	Sent    bool   `db:"sent" json:"sent"`
+	ID        string `db:"id" json:"id"`
+	Agent     string `db:"agent" json:"agent"`
+	Run       string `db:"run" json:"run"`
+	Ordinal   int    `db:"ordinal" json:"ordinal"`
+	Content   string `db:"content" json:"content"`
+	Wire      []byte `db:"wire" json:"-"`
+	Sent      bool   `db:"sent" json:"sent"`
+	Discarded bool   `db:"discarded" json:"discarded"`
+	Prepared  bool   `db:"prepared" json:"prepared"`
 }
 
 func (s *Store) Enqueue(agent, source, input string) (string, error) {
@@ -302,7 +327,7 @@ func (s *Store) History(agent string) ([]Run, []Outbox, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	err = s.App.DB().NewQuery(`SELECT id,agent,run,ordinal,content,sent FROM post_outbox WHERE agent={:a} ORDER BY rowid DESC LIMIT 100`).Bind(dbx.Params{"a": agent}).All(&out)
+	err = s.App.DB().NewQuery(`SELECT o.id,o.agent,o.run,o.ordinal,o.content,o.sent,EXISTS(SELECT 1 FROM post_discarded d WHERE d.id=o.id) AS discarded,COALESCE(length(o.wire),0)>0 AS prepared FROM post_outbox o WHERE o.agent={:a} ORDER BY o.rowid DESC LIMIT 100`).Bind(dbx.Params{"a": agent}).All(&out)
 	return runs, out, err
 }
 func (s *Store) Review(agent, id string, replay bool) error {

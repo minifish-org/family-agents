@@ -1,77 +1,125 @@
 "use strict";
-let token = "";
-let credentialAgent = "";
-const el = (id) => document.getElementById(id);
-const notice = (text) => { el("notice").textContent = text; };
-async function request(path, body) {
-  const response = await fetch(path, { method: body === undefined ? "GET" : "POST", headers: { "Content-Type": "application/json", ...(token ? { Authorization: token } : {}) }, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store", credentials: "omit" });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.message || "Request failed");
-  return data;
-}
-function node(tag, text, className) {
-  const item = document.createElement(tag);
-  if (text !== undefined) item.textContent = text;
-  if (className) item.className = className;
-  return item;
-}
-async function operation(id, action, body = {}) {
-  await request("/api/post/agents/" + encodeURIComponent(id) + "/" + action, body);
-  notice("Operation completed: " + action);
-  await refresh();
-}
-function button(label, fn) {
-  const b = node("button", label);
-  b.onclick = async () => { b.disabled = true; try { await fn(); } catch (error) { notice(error.message); } finally { b.disabled = false; } };
-  return b;
-}
-async function refresh() {
-  const agents = await request("/api/post/agents");
-  el("agents").replaceChildren();
-  if (!agents.length) el("agents").append(node("p", "Create an owner and agent in the configuration dashboard, then refresh to enter credentials."));
-  const grouped = new Map();
-  for (const agent of agents) {
-    const owner = agent.config.owner;
-    if (!grouped.has(owner)) grouped.set(owner, []);
-    grouped.get(owner).push(agent);
+(() => {
+ const main=document.getElementById("main"),editor=document.getElementById("editor"),confirmation=document.getElementById("confirm-dialog");
+ const state={auth:null,csrf:"",people:[],agents:[],server:{},view:"people",busy:false,notice:"",error:"",editing:null,file:null,preview:"",removeImage:false,created:"",request:"",connecting:{}};
+ const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+ const field=(label,name,value="",options={})=>`<label class="field"><span>${label}</span><input name="${name}" value="${esc(value)}" type="${options.type||"text"}" ${options.required?'required':''} ${options.readonly?'readonly':''} ${options.max?`maxlength="${options.max}"`:''} autocomplete="${options.autocomplete||'off'}" placeholder="${esc(options.placeholder||"")}">${options.hint?`<small>${options.hint}</small>`:""}</label>`;
+ const button=(label,action,cls="",attrs="")=>`<button type="button" data-action="${action}" class="${cls}" ${attrs}>${label}</button>`;
+ const byID=id=>state.agents.find(a=>a.config.id===id);
+ const owner=id=>state.people.find(p=>p.id===id);
+ const imageURL=a=>a?.avatar?`/api/post/assistants/${a.config.id}/avatar?v=${a.avatar}`:"";
+ const personImageURL=p=>p?.avatar?`/api/post/owners/${p.id}/avatar?v=${p.avatar}`:"";
+ const personAvatar=(p,large=false)=>avatar(p.name===p.mxid?p.mxid.replace(/^@/,""):p.name,personImageURL(p),large);
+ const avatar=(name,url="",large=false)=>`<span class="avatar ${large?'large':''}"><span>${esc(Array.from(name||"A")[0].toUpperCase())}</span>${url?`<img src="${esc(url)}" alt="">`:''}</span>`;
+ function status(a){if(a.starting||state.connecting[a.config.id])return{label:"Connecting",kind:""};if(a.review||a.state.paused||a.state.last_error)return{label:"Needs attention",kind:"attention"};if(a.draining)return{label:"Finishing",kind:""};if(!a.running)return{label:"Off",kind:""};if(a.state.awaiting_owner)return{label:"Invitation sent",kind:""};return{label:"Connected",kind:"ready"};}
+ const footer=()=>'<footer class="footer"><a href="https://github.com/minifish-org/pith-post" target="_blank" rel="noreferrer">Pith Post · Source code</a> · AGPL-3.0</footer>';
+ function say(message){document.getElementById("live").textContent=message;}
+ async function api(path,{method="GET",data,token}={}){
+  const raw=data instanceof Blob;let response;const control=new AbortController(),timer=setTimeout(()=>control.abort(),100000);
+  try{response=await fetch(path.startsWith("/api/")?path:"/api/post"+path,{method,credentials:"same-origin",cache:"no-store",signal:control.signal,headers:{"Content-Type":raw?data.type||"application/octet-stream":"application/json",...(state.csrf?{"X-Pith-CSRF":state.csrf}:{}),...(token?{Authorization:token}:{})},body:data===undefined?undefined:raw?data:JSON.stringify(data)});}catch{throw Error("Connection lost. Refresh the list before retrying; your change may have been saved.");}finally{clearTimeout(timer);}
+  const result=await response.json().catch(()=>({}));
+  if(!response.ok){if(response.status===401&&state.auth){closeEditor();state.auth=null;state.csrf="";state.people=[];state.agents=[];state.error="Sign in to continue.";render();}const e=Error(result.message||"Could not save this change.");e.status=response.status;throw e;}
+  return result;
+ }
+ async function load(){const[people,agents,server]=await Promise.all([api("/owners"),api("/agents"),api("/defaults")]);Object.assign(state,{people,agents,server});document.getElementById("connection-banner").hidden=true;}
+ function render(){
+  document.getElementById("topbar").hidden=!state.auth;
+  document.querySelectorAll('nav [data-view]').forEach(b=>{if(b.dataset.view===state.view)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");});
+  const feedback=`${state.notice?`<div class="notice" role="status">${esc(state.notice)}</div>`:""}${state.error?`<div class="error" role="alert">${esc(state.error)}</div>`:""}`;
+  if(!state.auth){main.innerHTML=`<section class="login"><div class="brand"><span class="brand-mark">p</span>Pith Post</div><h1>Sign in</h1>${feedback}<form id="login-form">${field("Email","identity","",{required:true,type:"email",autocomplete:"username"})}${field("Password","password","",{required:true,type:"password",autocomplete:"current-password"})}<button class="primary" type="submit">Sign in</button></form>${footer()}</section>`;}
+  else if(state.view==="settings"){
+   const locked=state.agents.length>0||state.people.length>0;
+   main.innerHTML=`<div class="page-head"><h1>Settings</h1></div>${feedback}<section class="panel"><h2 class="settings-title">Matrix server</h2><form id="server-form">${field("Server address","homeserver",state.server.homeserver,{type:"url",required:true,readonly:locked,placeholder:"https://matrix.example.org",hint:locked?"Remove all agents and people before changing this address.":"One server for all people and agents. The connection is checked before saving."})}<div class="actions">${button("Check connection","check-server")}${!locked?'<button type="submit" class="primary" id="save-server" hidden>Save server</button>':""}</div><p id="server-status" class="profile-note" role="status" hidden></p></form></section><div class="settings-account">${button("Sign out","logout","quiet")}</div>${footer()}`;
+  }else{
+   main.innerHTML=`<div class="page-head"><h1>People</h1>${state.server.homeserver?button("+ Add person","add-person","primary"):button("Configure Matrix server","show-server","primary")}</div>${feedback}${!state.server.homeserver?'<p class="empty-page">Start by connecting your Matrix server.</p>':!state.people.length?'<p class="empty-page">Add a person, then add their agents.</p>':`<div class="stack">${state.people.map(p=>{const agents=state.agents.filter(a=>a.config.owner_id===p.id);return `<section class="person" data-person="${p.id}"><header class="person-head"><div class="person-identity">${personAvatar(p)}<div class="person-text"><h2 aria-label="${esc(p.name)}">${button(esc(p.name),"view-person","person-name",`data-id="${p.id}" aria-label="View ${esc(p.name)}"`)}</h2>${p.name!==p.mxid?`<p>${esc(p.mxid)}</p>`:""}</div></div><div class="actions">${button("+ Agent","add-agent","",`data-person="${p.id}"`)}</div></header><div class="agent-list">${agents.length?agents.map(a=>{const st=status(a);return `<button type="button" class="agent-row" data-action="edit-agent" data-id="${a.config.id}">${avatar(a.config.name,imageURL(a))}<span class="agent-info"><span class="agent-name">${esc(a.config.name)}</span>${a.profile_pending?`<span class="agent-note">${a.profile_error?'Profile update needs attention':'Updating Matrix profile…'}</span>`:""}</span><span class="status ${st.kind}">${st.label}</span><span class="chevron" aria-hidden="true">›</span></button>`}).join(""):'<p class="empty">No agents yet.</p>'}</div></section>`}).join("")}</div>`}${footer()}`;
   }
-  for (const [owner, entries] of grouped) {
-    el("agents").append(node("h2", owner, "owner"));
-    for (const entry of entries) {
-      const c = entry.config;
-      const card = node("article", undefined, "card");
-      card.append(node("h3", c.name), node("div", entry.running ? "Running" : "Stopped", "status"));
-      card.append(node("p", c.bot + " · " + c.model, "meta"));
-      card.append(node("p", "Room: " + (entry.state.room || "Not bound") + " · Device: " + (entry.state.device || "Not initialized") + " · Conversation: " + entry.state.conversation, "meta"));
-      if (entry.state.paused) card.append(node("p", "Paused: " + entry.state.paused));
-      if (entry.state.last_error) card.append(node("p", entry.state.last_error));
-      if (entry.review) card.append(node("p", "Interrupted execution requires review. No automatic replay."));
-      const controls = node("div", undefined, "controls");
-      for (const action of ["start", "stop", "restart", "resume"]) controls.append(button(action[0].toUpperCase() + action.slice(1), () => operation(c.id, action)));
-      controls.append(button("Credentials", () => { credentialAgent = c.id; el("credential-form").reset(); el("credentials").showModal(); }));
-      controls.append(button("History", async () => { const data = await request("/api/post/agents/" + c.id + "/history"); el("history-content").textContent = JSON.stringify(data, null, 2); el("history").hidden = false; el("history").scrollIntoView(); }));
-      controls.append(button("Proactive task", async () => { const prompt = window.prompt("Ask Pith to prepare content for the owner. No new inbound message is required."); if (prompt) await operation(c.id, "trigger", { key: crypto.randomUUID(), prompt }); }));
-      controls.append(button("New conversation", async () => { if (confirm("The agent must be stopped with no pending work. Keep the Matrix identity and archive the current conversation?")) await operation(c.id, "new-conversation"); }));
-      controls.append(button("Review interrupted run", async () => { const run = window.prompt("Run ID from history:"); if (!run) return; const replay = confirm("Replay this run? Choose Cancel to mark it reviewed without replay. Verify possible external effects first."); if (confirm("I have reviewed all possible external effects and the partial conversation.")) await operation(c.id, "review", { run, replay, confirm_external_effects_reviewed: true }); }));
-      controls.append(button("Reset encryption identity", async () => { if (!confirm("This is NOT a restart. Restore the original crypto store and master key first. Continue only if recovery is confirmed impossible. The agent must be stopped with all work resolved.")) return; const reason = window.prompt("Record why recovery is impossible (10–500 bytes, no secrets):"); if (reason && confirm("Create a replacement device? Old encrypted history may be unreadable. This reset can run only once.")) await operation(c.id, "reset-identity", { reason, confirm_recovery_impossible: true }); }));
-      card.append(controls);
-      el("agents").append(card);
-    }
-  }
-}
-el("login-form").onsubmit = async (event) => {
-  event.preventDefault(); const form = new FormData(event.target);
-  try {
-    const data = await request("/api/collections/_superusers/auth-with-password", { identity: form.get("identity"), password: form.get("password") });
-    token = data.token; event.target.reset(); el("login").hidden = true; el("refresh").hidden = false; el("logout").hidden = false; notice(""); await refresh();
-  } catch (error) { notice(error.message); }
-};
-el("refresh").onclick = () => refresh().catch((error) => notice(error.message));
-el("logout").onclick = () => { token = ""; location.reload(); };
-el("cancel-credentials").onclick = () => { el("credential-form").reset(); el("credentials").close(); };
-el("credential-form").onsubmit = async (event) => {
-  event.preventDefault(); const body = {};
-  for (const [key, value] of new FormData(event.target)) if (value) body[key] = value;
-  event.target.reset(); el("credentials").close();
-  try { await operation(credentialAgent, "credentials", body); } catch (error) { notice(error.message); }
-};
+  if(state.auth&&state.view==="settings")updateServerActions();
+  main.setAttribute("aria-busy",String(state.busy));document.title=(state.auth?state.view==="settings"?"Settings":"People":"Sign in")+" · Pith Post";
+ }
+ function errorIn(form,message){let node=form.querySelector('.form-error');if(!node){node=document.createElement('p');node.className='error form-error';node.setAttribute('role','alert');form.prepend(node);}node.textContent=message;say(message);}
+ async function work(control,fn){if(state.busy)return;state.busy=true;main.setAttribute("aria-busy","true");const label=control?.textContent;if(control){control.disabled=true;control.textContent=control.closest('#login-form')?"Signing in…":control.dataset.action==='check-server'?"Checking…":"Saving…";}try{await fn();}catch(e){const form=control?.closest('form');if(form?.isConnected)errorIn(form,e.message);else{state.error=e.message;render();}}finally{state.busy=false;main.setAttribute("aria-busy","false");if(control?.isConnected){control.disabled=false;control.textContent=state.created&&control.closest('#agent-form')?'Save agent':label;}updateAgentSave();}}
+ function closeEditor(){if(state.preview)URL.revokeObjectURL(state.preview);state.preview="";state.file=null;state.removeImage=false;state.editing=null;state.created="";if(editor.open)editor.close();editor.innerHTML="";}
+ function openPerson(id){
+  closeEditor();const p=id?owner(id):null;state.editing={kind:"person",id};
+  if(p){editor.innerHTML=`<div class="person-detail"><span id="person-avatar">${personAvatar(p,true)}</span><div><h2 id="editor-title">${esc(p.name)}</h2><p class="account-id" id="person-mxid" ${p.name===p.mxid?"hidden":""}>${esc(p.mxid)}</p></div></div><p class="profile-note">Name and image update automatically from Matrix.</p>${state.agents.some(a=>a.config.owner_id===id)?'<p class="profile-note">Remove their agents before removing this person.</p>':""}<footer class="dialog-foot">${button("Remove person","remove-person","danger",`data-id="${p.id}" ${state.agents.some(a=>a.config.owner_id===id)?'disabled':''}`)}<div class="actions">${button("Close","close-editor")}</div></footer>`;}
+  else{editor.innerHTML=`<h2 id="editor-title">Add person</h2><p class="subtitle">Their name and image are read from Matrix.</p><form id="person-form">${field("Matrix ID","mxid","",{required:true,max:255,placeholder:"@person:example.org"})}<footer class="dialog-foot"><div class="actions">${button("Cancel","close-editor")}<button type="submit" class="primary">Add person</button></div></footer></form>`;}
+  editor.showModal();(editor.querySelector('input')||editor.querySelector('[data-action=close-editor]'))?.focus();
+ }
+ function updateServerActions(){const form=document.getElementById('server-form');if(!form)return;const save=form.querySelector('#save-server'),check=form.querySelector('[data-action=check-server]'),address=form.elements.homeserver.value.trim().replace(/\/+$/,'');const changed=!!save&&address!==String(state.server.homeserver||'').replace(/\/+$/,'');if(save)save.hidden=!changed;check.hidden=changed||!address;}
+ function agentDirty(){const form=editor.querySelector('#agent-form');if(!form)return false;return !!state.file||state.removeImage||form.elements.name.value.trim()!==form.dataset.savedName;}
+ function updateAgentSave(){const form=editor.querySelector('#agent-form');if(form?.dataset.id&&!state.busy)form.querySelector('[type=submit]').disabled=!agentDirty();}
+ function editorDirty(){const form=editor.querySelector('form');if(!form)return false;if(form.id==='person-form')return !!form.elements.mxid.value.trim();if(form.dataset.id)return agentDirty();return Array.from(form.elements).some(e=>e.type!=='hidden'&&e.name&&e.value);}
+ function agentRepair(a,p){
+  if(!a)return '';
+  const id=a.config.id;
+  if(a.review)return `<div class="repair">An interrupted reply needs review. ${button("Review reply","review-agent","text",`data-id="${id}"`)}</div>`;
+  if(a.starting||state.connecting[id])return '<p class="profile-note" role="status">Connecting…</p>';
+  if(!a.running)return `<div class="repair">${esc(a.state.last_error||"This agent is off.")}${button("Connect","connect-agent","",`data-id="${id}"`)}</div>`;
+  if(a.state.paused)return `<div class="repair">Check that the private chat contains only ${esc(p.name)} and this agent.${button("Check connection","resume-agent","",`data-id="${id}"`)}</div>`;
+  if(a.state.last_error)return `<p class="profile-note">${esc(a.state.last_error)}</p>`;
+  return '';
+ }
+ function agentProfile(a){return a?.profile_pending?`<p class="profile-note" role="status">${esc(profileNote(a))}</p>${a.profile_error?button("Retry profile update","sync-profile","text",`data-id="${a.config.id}"`):""}`:'';}
+ function personSummary(p){return `${personAvatar(p)}<span>For ${esc(p.name)}</span>`;}
+ function updatePersonDetails(p){if(!p)return;const node=editor.querySelector('#person-avatar'),html=personAvatar(p,true);if(node&&node.innerHTML!==html)node.innerHTML=html;const title=editor.querySelector('#editor-title');if(title)title.textContent=p.name;const mxid=editor.querySelector("#person-mxid");if(mxid)mxid.hidden=p.name===p.mxid;}
+ function updateAgentStatus(a){if(!a)return;const p=owner(a.config.owner_id);if(!p)return;const summary=editor.querySelector('#agent-owner'),html=personSummary(p);if(summary&&summary.innerHTML!==html)summary.innerHTML=html;for(const[id,html]of[['agent-repair',agentRepair(a,p)],['agent-profile',agentProfile(a)]]){const node=editor.querySelector('#'+id);if(node&&node.innerHTML!==html)node.innerHTML=html;}}
+ function updatePreview(){const form=editor.querySelector('#agent-form');if(!form)return;const a=byID(form.dataset.id);const src=state.preview||(!state.removeImage?imageURL(a):"");editor.querySelector('#avatar-preview').innerHTML=avatar(form.elements.name.value,src,true);const remove=editor.querySelector('[data-action=remove-image]');if(remove)remove.hidden=!src;updateAgentSave();}
+ function profileNote(a){return a.profile_pending?(a.profile_error||"Updating Matrix profile…"):"";}
+ function openAgent(personID,id){closeEditor();const a=id?byID(id):null,p=owner(personID||a?.config.owner_id);if(!p)return;state.editing={kind:"agent",id,person:p.id};state.request=crypto.randomUUID();
+  editor.innerHTML=`<h2 id="editor-title">${a?'Edit agent':'Add agent'}</h2><p class="subtitle owner-summary" id="agent-owner">${personSummary(p)}</p><form id="agent-form" data-id="${id||""}" data-person="${p.id}" data-saved-name="${esc(a?.config.name||"")}"><input type="hidden" name="revision" value="${esc(a?.appearance_revision||"")}"><div class="avatar-picker"><label class="avatar-select" for="avatar-file"><span id="avatar-preview">${avatar(a?.config.name||"A",imageURL(a),true)}</span><span>Choose image<small>PNG, JPEG, GIF or WebP · up to 2 MB</small></span></label><input class="sr" id="avatar-file" name="avatar" type="file" accept="image/png,image/jpeg,image/gif,image/webp">${button("Remove image","remove-image","text",!a?.avatar?'hidden':'')}</div>${field("Display name","name",a?.config.name||"",{required:true,max:100,placeholder:"e.g. Dot"})}${!a?`<div id="agent-credentials">${field("Matrix account","bot","",{required:true,max:255,placeholder:"@agent:example.org",hint:"A separate account for this agent."})}${field("Account password","password","",{required:true,type:"password",autocomplete:"new-password"})}</div>`:`<p class="account-id">${esc(a.config.bot)}</p>`}<div id="agent-repair">${agentRepair(a,p)}</div><div id="agent-profile">${agentProfile(a)}</div>${a?.state.sync_warning?`<p class="profile-note">${esc(a.state.sync_warning)}</p>`:""}<footer class="dialog-foot">${a?button("Remove agent","remove-agent","danger",`data-id="${id}"`):""}<div class="actions">${button("Cancel","close-editor")}<button type="submit" class="primary">${a?'Save agent':'Create agent'}</button></div></footer></form>`;
+  updateAgentSave();editor.showModal();editor.querySelector('[name=name]').focus();
+ }
+ function ask(title,body,label){return new Promise(resolve=>{confirmation.innerHTML=`<h2 id="confirm-title">${esc(title)}</h2><p>${esc(body)}</p><div class="actions"><button type="button" data-confirm="no">Cancel</button><button type="button" class="danger-solid" data-confirm="yes">${esc(label)}</button></div>`;const finish=value=>{confirmation.close();resolve(value);};confirmation.querySelector('[data-confirm=no]').onclick=()=>finish(false);confirmation.querySelector('[data-confirm=yes]').onclick=()=>finish(true);confirmation.oncancel=e=>{e.preventDefault();finish(false);};confirmation.showModal();});}
+ async function refresh(message=""){await load();state.notice=message;state.error="";render();say(message);}
+ const op=(id,action,data={})=>api(`/agents/${id}/${action}`,{method:"POST",data});
+ function connect(id){if(state.connecting[id])return;state.connecting[id]=true;
+  (async()=>{try{await op(id,'enable');}catch{state.notice='Agent saved. Check its Matrix account connection.';}finally{delete state.connecting[id];try{await load();if(!editor.open)render();}catch{}}})();
+ }
+
+ document.addEventListener('click',async event=>{
+  const view=event.target.closest('[data-view]');if(view){if(state.busy)return;state.view=view.dataset.view;state.notice="";state.error="";render();return;}
+  const b=event.target.closest('[data-action]');if(!b||state.busy)return;const action=b.dataset.action,id=b.dataset.id;
+  if(action==='close-editor'){closeEditor();return;}
+  if(action==='show-server'){state.view='settings';render();return;}
+  if(action==='add-person'||action==='view-person'){openPerson(id);return;}
+  if(action==='add-agent'||action==='edit-agent'){openAgent(b.dataset.person,id);return;}
+  if(action==='remove-image'){if(state.preview)URL.revokeObjectURL(state.preview);state.preview="";state.file=null;state.removeImage=true;editor.querySelector('[name=avatar]').value="";updatePreview();return;}
+  if(action==='remove-person'&&!await ask('Remove this person?','Their Matrix account is kept.','Remove person'))return;
+  if(action==='remove-agent'&&!await ask('Remove this agent?','It will stop replying and leave unfinished tasks unprocessed. Its Matrix account and history are kept.','Remove agent'))return;
+  await work(b,async()=>{
+   if(action==='check-server'){const form=b.closest('form');form.querySelector('.form-error')?.remove();const note=form.querySelector('#server-status');note.hidden=true;const address=form.elements.homeserver.value.trim();await api('/defaults/check',{method:'POST',data:{homeserver:address}});if(form.elements.homeserver.value.trim()!==address)return;note.textContent='Matrix server is reachable.';note.hidden=false;say(note.textContent);}
+   else if(action==='logout'){await api('/session',{method:'DELETE'});closeEditor();Object.assign(state,{auth:null,csrf:'',people:[],agents:[],notice:'',error:''});render();}
+   else if(action==='remove-person'){await api(`/owners/${id}`,{method:'DELETE'});closeEditor();await refresh('Person removed.');}
+   else if(action==='remove-agent'){await api(`/assistants/${id}`,{method:'DELETE'});closeEditor();await refresh('Agent removed.');}
+   else if(action==='connect-agent'){connect(id);updateAgentStatus(byID(id));}else if(action==='resume-agent'){await op(id,'resume');await load();updateAgentStatus(byID(id));}
+   else if(action==='sync-profile'){await api(`/assistants/${id}/profile-sync`,{method:'POST',data:{}});const a=byID(id);if(a){a.profile_error='';a.profile_pending=true;updateAgentStatus(a);}}
+   else if(action==='review-agent'){
+    const h=await api(`/agents/${id}/history`),r=h.runs.find(r=>r.status==='interrupted');if(!r)throw Error('This reply has already been reviewed. Reopen the agent.');
+    if(!await ask('Leave this reply unfinished?',`Task: ${r.input}\n\nIt will be kept in history without replaying or sending it.`,'Leave unfinished'))return;
+    const enabled=byID(id).config.auto_start;await op(id,'stop');await op(id,'review',{run:r.id,replay:false,confirm_external_effects_reviewed:true});if(enabled)await op(id,'enable');await load();updateAgentStatus(byID(id));
+   }
+  });
+ });
+ document.addEventListener('input',event=>{if(event.target.closest('#server-form')){const form=event.target.closest('form');form.querySelector('.form-error')?.remove();form.querySelector('#server-status').hidden=true;updateServerActions();}if(event.target.name==='name'&&event.target.closest('#agent-form'))updatePreview();});
+ document.addEventListener('change',event=>{if(event.target.id!=='avatar-file')return;const file=event.target.files[0];if(!file)return;const form=event.target.closest('form');if(file.size>2*1024*1024){errorIn(form,'Choose an image smaller than 2 MB.');event.target.value='';return;}if(!['image/png','image/jpeg','image/gif','image/webp'].includes(file.type)){errorIn(form,'Choose a PNG, JPEG, GIF or WebP image.');event.target.value='';return;}if(state.preview)URL.revokeObjectURL(state.preview);state.file=file;state.preview=URL.createObjectURL(file);state.removeImage=false;updatePreview();});
+ document.addEventListener('error',event=>{if(event.target.matches?.('.avatar img'))event.target.remove();},true);
+ document.addEventListener('submit',event=>{
+  const form=event.target;if(!['login-form','server-form','person-form','agent-form'].includes(form.id))return;event.preventDefault();const b=event.submitter;if(state.busy)return;
+  const d=new FormData(form);work(b,async()=>{
+   if(form.id==='login-form'){const result=await api('/api/collections/_superusers/auth-with-password',{method:'POST',data:{identity:d.get('identity'),password:d.get('password')}});if(!result.token)throw Error('This account requires another sign-in method.');const session=await api('/session',{method:'POST',data:{},token:result.token});result.token='';state.auth=session;state.csrf=session.csrf;form.reset();await load();state.view=state.server.homeserver?'people':'settings';state.error='';render();}
+   else if(form.id==='server-form'){await api('/defaults',{method:'POST',data:{homeserver:String(d.get('homeserver')).trim()}});state.view='settings';await refresh('Matrix server saved.');}
+   else if(form.id==='person-form'){const id=form.dataset.id;await api(id?`/owners/${id}`:'/owners',{method:id?'PATCH':'POST',data:{mxid:String(d.get('mxid')).trim()}});closeEditor();await refresh();}
+   else if(form.id==='agent-form'){
+    let id=form.dataset.id||state.created;
+    if(!id){const result=await api('/assistants',{method:'POST',data:{request_id:state.request,name:String(d.get('name')).trim(),owner_id:form.dataset.person,bot:String(d.get('bot')).trim(),password:d.get('password')}});id=result.id;state.created=id;form.dataset.savedName=String(d.get('name')).trim();form.elements.password.value='';form.elements.password.required=false;form.elements.bot.required=false;form.querySelector('#agent-credentials').hidden=true;b.textContent='Save agent';}
+    if(id&&String(d.get('name')).trim()!==form.dataset.savedName){let revision=d.get('revision');if(state.created){const latest=await api('/agents');revision=latest.find(a=>a.config.id===id)?.appearance_revision;}const saved=await api(`/assistants/${id}/appearance`,{method:'PATCH',data:{name:String(d.get('name')).trim(),revision}});form.elements.revision.value=saved.revision;form.dataset.savedName=String(d.get('name')).trim();}
+    if(state.file)await api(`/assistants/${id}/avatar`,{method:'PUT',data:state.file});else if(state.removeImage)await api(`/assistants/${id}/avatar`,{method:'DELETE'});
+    const newlyCreated=!form.dataset.id;closeEditor();if(newlyCreated)connect(id);await refresh();
+   }
+  });
+ });
+ editor.addEventListener('cancel',event=>{if(state.busy){event.preventDefault();return;}event.preventDefault();closeEditor();});
+ setInterval(async()=>{if(!state.auth||state.busy||document.hidden)return;try{await load();if(!editor.open&&state.view!=='settings')render();else if(state.editing?.kind==='agent'){const a=byID(state.editing.id);updateAgentStatus(a);}else if(state.editing?.kind==='person'){updatePersonDetails(owner(state.editing.id));}}catch{if(state.auth){const banner=document.getElementById('connection-banner');banner.hidden=false;banner.textContent='Connection lost. Reconnecting…';}}},5000);
+ window.addEventListener('beforeunload',event=>{if(state.busy||editorDirty()){event.preventDefault();event.returnValue='';}});
+ (async()=>{try{state.auth=await api('/session');state.csrf=state.auth.csrf;await load();state.view=state.server.homeserver?'people':'settings';}catch(e){if(e.status!==401)state.error=e.message;}render();})();
+})();

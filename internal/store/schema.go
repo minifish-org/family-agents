@@ -18,7 +18,11 @@ func EnsureSchema(app core.App) error {
 			return err
 		}
 	}
-	if _, err = app.FindCollectionByNameOrId("agents"); err == nil {
+	if existing, findErr := app.FindCollectionByNameOrId("agents"); findErr == nil {
+		if existing.Fields.GetByName("model_connection") == nil {
+			existing.Fields.Add(&core.TextField{Name: "model_connection", Max: 80})
+			return app.Save(existing)
+		}
 		return nil
 	}
 	agents := core.NewBaseCollection("agents")
@@ -34,6 +38,7 @@ func EnsureSchema(app core.App) error {
 		&core.NumberField{Name: "context_window", Required: true, OnlyInt: true},
 		&core.NumberField{Name: "max_tokens", Required: true, OnlyInt: true},
 		&core.BoolField{Name: "auto_start"}, &core.BoolField{Name: "auto_reset"},
+		&core.TextField{Name: "model_connection", Max: 80},
 	)
 	agents.AddIndex("idx_bot_mxid", true, "bot_mxid", "")
 	return app.Save(agents)

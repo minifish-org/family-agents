@@ -23,8 +23,9 @@ import (
 var assets embed.FS
 
 type Admin struct {
-	Manager *agent.Manager
-	Matrix  matrix.Factory
+	Manager             *agent.Manager
+	Matrix              matrix.Factory
+	PersonProfileLookup func(context.Context, string) (matrix.PersonProfile, error)
 }
 
 func decode(e *core.RequestEvent, v any) error {
@@ -41,26 +42,85 @@ func decode(e *core.RequestEvent, v any) error {
 }
 func (a Admin) Register(e *core.ServeEvent) {
 	sub, _ := fs.Sub(assets, "web")
+	e.Router.GET("/", func(e *core.RequestEvent) error {
+		e.Response.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		e.Response.Header().Set("Cache-Control", "no-store")
+		e.Response.Header().Set("X-Content-Type-Options", "nosniff")
+		e.Response.Header().Set("Referrer-Policy", "no-referrer")
+		page, err := assets.ReadFile("web/index.html")
+		if err != nil {
+			return err
+		}
+		return e.HTML(200, string(page))
+	})
+	e.Router.GET("/preview/", func(e *core.RequestEvent) error { return e.Redirect(302, "/") })
 	e.Router.GET("/post/{path...}", func(e *core.RequestEvent) error {
-		e.Response.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		e.Response.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 		e.Response.Header().Set("X-Content-Type-Options", "nosniff")
 		e.Response.Header().Set("Referrer-Policy", "no-referrer")
 		e.Response.Header().Set("Cache-Control", "no-store")
 		return apis.Static(sub, true)(e)
 	})
 	api := e.Router.Group("/api/post")
-	api.Bind(apis.RequireSuperuserAuth())
+	api.Bind(sessionAuth(), apis.RequireSuperuserAuth())
+	api.GET("/session", a.getSession)
+	api.POST("/session", a.createSession)
+	api.DELETE("/session", a.logout)
+	api.GET("/owners", a.owners)
+	api.GET("/owners/{id}/avatar", a.personAvatar)
+	api.GET("/defaults", a.getDefaults)
+	api.POST("/defaults", a.saveDefaults)
+	api.POST("/defaults/check", a.checkServer)
+	api.POST("/owners", a.savePerson)
+	api.PATCH("/owners/{id}", a.savePerson)
+	api.DELETE("/owners/{id}", a.deletePerson)
+	api.GET("/account", a.account)
+	api.POST("/account/password", a.changePassword)
+	api.POST("/assistants", a.createAssistant)
+	api.PATCH("/assistants/{id}", a.updateAssistant)
+	api.DELETE("/assistants/{id}", a.deleteAssistant)
+	api.PATCH("/assistants/{id}/appearance", a.saveAppearance)
+	api.GET("/assistants/{id}/avatar", a.getAvatar)
+	api.PUT("/assistants/{id}/avatar", a.putAvatar)
+	api.DELETE("/assistants/{id}/avatar", a.removeAvatar)
+	api.POST("/assistants/{id}/profile-sync", func(e *core.RequestEvent) error {
+		if _, err := a.Manager.Store.Config(e.Request.PathValue("id")); err != nil {
+			return e.NotFoundError("Agent not found.", nil)
+		}
+		a.syncAppearance(e.Request.PathValue("id"))
+		return e.JSON(200, map[string]bool{"ok": true})
+	})
+	api.GET("/connections", a.listConnections)
+	api.POST("/connections", a.saveConnection)
+	api.PATCH("/connections/{id}", a.saveConnection)
+	api.DELETE("/connections/{id}", a.deleteConnection)
+	api.POST("/connections/{id}/check", a.checkConnection)
+	api.GET("/draft", a.getDraft)
+	api.POST("/draft", a.saveDraft)
+	api.DELETE("/draft", a.deleteDraft)
+	api.GET("/profile", a.getProfile)
+	api.POST("/profile", a.saveProfile)
 	api.GET("/agents", func(e *core.RequestEvent) error {
 		configs, err := a.Manager.Store.Configs()
 		if err != nil {
 			return e.InternalServerError("Configuration could not be loaded", nil)
 		}
 		type view struct {
-			Config      domain.Config `json:"config"`
-			State       domain.State  `json:"state"`
-			Running     bool          `json:"running"`
-			Review      bool          `json:"review"`
-			Credentials bool          `json:"credentials"`
+			Config             domain.Config `json:"config"`
+			State              domain.State  `json:"state"`
+			Starting           bool          `json:"starting"`
+			Running            bool          `json:"running"`
+			Review             bool          `json:"review"`
+			Credentials        bool          `json:"credentials"`
+			Password           bool          `json:"password_set"`
+			Token              bool          `json:"token_set"`
+			Counts             store.Counts  `json:"counts"`
+			Draining           bool          `json:"draining"`
+			Avatar             string        `json:"avatar"`
+			ProfilePending     bool          `json:"profile_pending"`
+			ProfileError       string        `json:"profile_error"`
+			Revision           string        `json:"revision"`
+			AppearanceRevision string        `json:"appearance_revision"`
 		}
 		result := make([]view, 0, len(configs))
 		for _, c := range configs {
@@ -73,7 +133,22 @@ func (a Admin) Register(e *core.ServeEvent) {
 				return e.InternalServerError("Run status could not be loaded", nil)
 			}
 			secrets, secretErr := a.Manager.Store.Secrets(c.ID)
-			result = append(result, view{c, state, a.Manager.Running(c.ID), review, secretErr == nil && (secrets.Password != "" || secrets.AccessToken != "")})
+			if secretErr != nil {
+				return e.InternalServerError("Stored credentials could not be opened. Check the original master key.", nil)
+			}
+			counts, err := a.Manager.Store.Counts(c.ID)
+			if err != nil {
+				return e.InternalServerError("Task status could not be loaded.", nil)
+			}
+			profile, err := a.Manager.Store.Profile(c.ID)
+			if err != nil {
+				return e.InternalServerError("Agent profile could not be loaded.", nil)
+			}
+			avatar := profile.Hash
+			if avatar == "none" {
+				avatar = ""
+			}
+			result = append(result, view{Starting: a.Manager.Starting(c.ID), Avatar: avatar, ProfilePending: c.Name != profile.AppliedName || profile.Hash != profile.AppliedHash, ProfileError: profile.Error, Config: c, State: state, Running: a.Manager.Running(c.ID), Review: review, Credentials: secrets.Password != "" || secrets.AccessToken != "", Password: secrets.Password != "", Token: secrets.AccessToken != "", Counts: counts, Draining: a.Manager.Draining(c.ID), Revision: revision(c), AppearanceRevision: appearanceRevision(c)})
 		}
 		e.Response.Header().Set("Cache-Control", "no-store")
 		return e.JSON(200, result)
@@ -91,8 +166,12 @@ func (a Admin) Register(e *core.ServeEvent) {
 		for i := range out {
 			var c domain.Content
 			if json.Unmarshal([]byte(out[i].Content), &c) == nil {
+				size := len(c.Data)
 				c.Data = nil
-				raw, _ := json.Marshal(c)
+				raw, _ := json.Marshal(struct {
+					domain.Content
+					Size int `json:"size,omitempty"`
+				}{c, size})
 				out[i].Content = string(raw)
 			}
 		}
@@ -111,6 +190,14 @@ func (a Admin) action(e *core.RequestEvent) error {
 	defer cancel()
 	var result any = map[string]bool{"ok": true}
 	switch action {
+	case "enable":
+		err = a.Manager.SetEnabled(id, true)
+	case "disable":
+		err = a.Manager.SetEnabled(id, false)
+	case "stop-now":
+		if err = a.Manager.SetEnabled(id, false); err == nil {
+			err = a.Manager.Stop(id)
+		}
 	case "start":
 		err = a.Manager.Start(id)
 	case "stop":
@@ -204,7 +291,7 @@ func (a Admin) action(e *core.RequestEvent) error {
 		return e.NotFoundError("Unknown management operation", nil)
 	}
 	if err != nil {
-		if errors.Is(err, domain.ErrPaused) || errors.Is(err, domain.ErrReview) || errors.Is(err, domain.ErrStopped) {
+		if errors.Is(err, domain.ErrPaused) || errors.Is(err, domain.ErrReview) || errors.Is(err, domain.ErrStopped) || errors.Is(err, domain.ErrAwaitingOwner) {
 			return e.BadRequestError(err.Error(), nil)
 		}
 		// Intentionally exclude raw database, model, and homeserver errors from responses and logs.

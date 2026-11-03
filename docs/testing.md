@@ -23,6 +23,12 @@ Useful focused tests:
     go test -tags goolm ./internal/pith -run 'TestRealSDK|TestModelRequestedShell'
     go test -tags goolm ./internal/admin ./internal/store
 
+### Actual browser workflow
+
+Start `python3 scripts/ui-fixture.py bin/pith-post` and feed its single JSON output line to `node scripts/browser-smoke.cjs`. The fixture includes synthetic login credentials and PNG images; it provisions a synthetic runtime model outside the product UI. Set `PLAYWRIGHT_MODULE` when the Playwright module is outside normal lookup paths. The browser and fixture must share loopback networking. Terminate the fixture with SIGTERM afterward.
+
+The test refuses non-loopback targets and non-fixture accounts. It exercises one-server setup, people and their nested agents, name edits, actual avatar uploads/normalization/persistence/removal, failed-upload retry, cancellation, owner isolation, deletion, cookie login/refresh/logout, blue-white styling under dark OS preference, and desktop/mobile overflow. It calls the real disposable HTTP backend and never sends to a live Matrix account. Real Matrix profile API behavior, identity preservation and provider-failure retry are additionally covered by `internal/matrix/profile_test.go` against an HTTP server double.
+
 ### Coverage map
 
 | Acceptance area | Offline evidence |
@@ -60,4 +66,4 @@ Record the Tuwunel/Element/model versions and pass/fail results in your private 
 
 ## Delivery verification record
 
-Verified in the implementation environment (Linux amd64, Go 1.27.2): build, ordinary tests, CGO-free tests, race-detector tests, vet, and the disposable binary smoke test. A source-only staged checkout is also built/tested/smoke-tested before delivery. Live Matrix/model credentials were not supplied; the live checklist above remains unverified.
+Verified in the implementation environment (Linux amd64, Go 1.27.2): build, ordinary tests, CGO-free tests, race-detector tests, vet, and the disposable binary smoke test. A source-only staged checkout is also built/tested/smoke-tested before delivery. The redesigned UI additionally passed the disposable Chromium workflow above. These tests do not certify a live message exchange; the live checklist above remains separate.

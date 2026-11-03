@@ -91,6 +91,14 @@ func (t *Transport) Run(ctx context.Context, onEvent func(domain.Inbound) error,
 		if handlerErr != nil || e.RoomID != t.room || string(e.Sender) != t.config.Owner || e.ID == "" {
 			return
 		}
+		state, stateErr := t.store.State(t.config.ID)
+		if stateErr != nil {
+			handlerErr = stateErr
+			return
+		}
+		if state.ChatSyncPending && e.Timestamp < state.ChatConnectedAt {
+			return
+		}
 		raw, err := json.Marshal(e)
 		if err == nil {
 			err = t.store.HoldEncrypted(t.config.ID, string(e.ID), raw)
@@ -107,7 +115,12 @@ func (t *Transport) Run(ctx context.Context, onEvent func(domain.Inbound) error,
 			membership := e.Content.AsMember().Membership
 			unsafe = ((member == t.config.Owner || member == t.config.Bot) && membership != event.MembershipJoin) || ((member != t.config.Owner && member != t.config.Bot) && (membership == event.MembershipJoin || membership == event.MembershipInvite || membership == event.MembershipKnock))
 		}
-		if unsafe {
+		state, stateErr := t.store.State(t.config.ID)
+		if stateErr != nil {
+			handlerErr = stateErr
+			return
+		}
+		if unsafe && (state.ChatConnectedAt == 0 || e.Timestamp >= state.ChatConnectedAt) {
 			handlerErr = t.store.UpdateState(t.config.ID, func(s *domain.State) error {
 				s.Paused = "Unsafe room membership observed; administrator resume required"
 				s.SecurityEpoch++
@@ -119,17 +132,20 @@ func (t *Transport) Run(ctx context.Context, onEvent func(domain.Inbound) error,
 		}
 		handlerErr = onMembership()
 	})
-	filter, err := t.client.Store.LoadFilterID(ctx, t.client.UserID)
+	// Retain the all-room filter across restarts so a new filter cannot reset timeline continuity.
+	filterState, err := t.store.State(t.config.ID)
 	if err != nil {
 		return err
 	}
+	filter := filterState.SyncFilterID
 	if filter == "" {
-		response, err := t.client.CreateFilter(ctx, &mautrix.Filter{Room: &mautrix.RoomFilter{Rooms: []id.RoomID{t.room}, IncludeLeave: true, Timeline: &mautrix.FilterPart{Limit: 100}}})
+		responseFilter, err := t.client.CreateFilter(ctx, &mautrix.Filter{Room: &mautrix.RoomFilter{IncludeLeave: true, Timeline: &mautrix.FilterPart{Limit: 100}}})
 		if err != nil {
 			return errors.New("cannot create Matrix sync filter")
 		}
-		filter = response.FilterID
-		if err = t.client.Store.SaveFilterID(ctx, t.client.UserID, filter); err != nil {
+		filter = responseFilter.FilterID
+		// SQLCryptoStore intentionally does not retain filter IDs; keep it with application state.
+		if err = t.store.UpdateState(t.config.ID, func(s *domain.State) error { s.SyncFilterAll = true; s.SyncFilterID = filter; return nil }); err != nil {
 			return err
 		}
 	}
@@ -156,10 +172,17 @@ func (t *Transport) Run(ctx context.Context, onEvent func(domain.Inbound) error,
 				continue
 			}
 		}
-		if room, ok := response.Rooms.Join[t.room]; ok && room.Timeline.Limited {
+		if err = t.requestChat(ctx, response, since); err != nil {
+			// Do not acknowledge to-device events here; replay the batch through the new crypto transport.
+			return err
+		}
+		state, stateErr := t.store.State(t.config.ID)
+		if stateErr != nil {
+			return stateErr
+		}
+		if room, ok := response.Rooms.Join[t.room]; ok && room.Timeline.Limited && !state.ChatSyncPending {
 			if err = t.store.UpdateState(t.config.ID, func(s *domain.State) error {
-				s.Paused = "Matrix timeline gap; review history and ask the owner to resend missing requests before resuming"
-				s.SecurityEpoch++
+				s.SyncWarning = "Some earlier messages may be missing. Send your request again."
 				return nil
 			}); err != nil {
 				return err
@@ -178,6 +201,11 @@ func (t *Transport) Run(ctx context.Context, onEvent func(domain.Inbound) error,
 		// mautrix.Client.SyncWithContext saves this cursor BEFORE callbacks. We must do the opposite.
 		if err = t.client.Store.SaveNextBatch(ctx, t.client.UserID, response.NextBatch); err != nil {
 			return err
+		}
+		if state.ChatSyncPending {
+			if err = t.store.UpdateState(t.config.ID, func(s *domain.State) error { s.ChatSyncPending = false; return nil }); err != nil {
+				return err
+			}
 		}
 		since = response.NextBatch
 	}

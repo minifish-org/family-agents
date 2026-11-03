@@ -94,6 +94,9 @@ func (s *Store) DiscardDelivery(agent, id, reason string) error {
 		if n != 1 {
 			return errors.New("pending delivery not found")
 		}
+		if _, err = app.DB().NewQuery(`INSERT INTO post_discarded(id,created) VALUES({:id},{:t})`).Bind(dbx.Params{"id": id, "t": time.Now().UnixMilli()}).Execute(); err != nil {
+			return err
+		}
 		_, err = app.DB().NewQuery(`INSERT INTO post_audit(agent,action,reason,created) VALUES({:a},'discard-delivery',{:r},{:t})`).Bind(dbx.Params{"a": agent, "r": id + ": " + reason, "t": time.Now().UnixMilli()}).Execute()
 		return err
 	})

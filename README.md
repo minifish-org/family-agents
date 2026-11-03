@@ -11,7 +11,10 @@ One **pith-post** binary embeds PocketBase, the [Pith Go coding-agent SDK](https
 - Multiple agents per full-MXID owner; separate bot devices, workspaces, persistent Pith conversations, and crypto databases.
 - Encrypted owner-only DM creation, authenticated/decrypted inbound text, durable event deduplication, serial per-agent execution, and concurrent agents.
 - Encrypted text/image/file delivery, including administrator-triggered proactive tasks; durable replies and stable retry transaction IDs.
-- PocketBase configuration CRUD, superuser-only lifecycle/history UI, write-only encrypted credential replacement.
+- A minimal blue-and-white administration UI: one Matrix server, people, and their nested agents.
+- People display the name and avatar from their existing Matrix profile automatically.
+- Agent display names and uploaded avatar images synchronize to the real Matrix profile with the original account identity.
+- Revocable administrator browser sessions, CSRF protection, and persistent availability.
 - Separate restart, new-conversation, and one-shot identity-reset operations. Unsafe membership pauses delivery until administrator review and resume.
 
 This is a **chat-only first implementation**, not an OS sandbox or general-purpose autonomous coding service. Tools are explicitly disabled. Proactive attachment bytes must be supplied by Pith's content envelope; the service does not fetch model-generated URLs or read model-generated file paths.
@@ -41,11 +44,11 @@ Create a PocketBase superuser while the service is stopped. In Bash, avoid stori
 
 The CLI password is briefly visible in process arguments; run provisioning on a trusted host. The application deliberately does not print PocketBase installer tokens.
 
-- Configuration: **http://127.0.0.1:8090/_/**
-- Agent management: **http://127.0.0.1:8090/post/**
+- Pith Post: **http://127.0.0.1:8090/** (also available at `/post/`)
+- Advanced PocketBase administration: **http://127.0.0.1:8090/_/**
 - Health: **http://127.0.0.1:8090/api/health**
 
-Follow [setup](docs/setup.md) to create the first owner/bot, accept the encrypted invite, and continue the conversation after a restart. Never expose the dashboard without TLS and appropriate network restrictions.
+Follow [setup](docs/setup.md) to add a person and configure their agent, accept its encrypted invitation, and continue the conversation after a restart. Never expose the dashboard without TLS and appropriate network restrictions.
 
 ## Verification and operations
 
@@ -55,7 +58,7 @@ Follow [setup](docs/setup.md) to create the first owner/bot, accept the encrypte
 - [Example configuration](examples/configuration.json)
 - [Example systemd service](deploy/pith-post.service)
 
-Offline tests exercise the real Pith SDK, a local model HTTP double, real Olm/Megolm and attachment encryption, a Matrix HTTP double, restart/deduplication paths, and API authorization. **A live Tuwunel + Element + model deployment has not been verified here.** See the live checklist before inviting family members.
+Offline tests exercise the real Pith SDK, a local model HTTP double, real Olm/Megolm and attachment encryption, a Matrix HTTP double, restart/deduplication paths, and API authorization. The live deployment has also been checked over Tailscale HTTPS for administrator login, Matrix profile reads, unchanged bot/device identity and encrypted reply delivery. The full deployment-specific checklist in [testing](docs/testing.md) remains separate from automated test coverage.
 
 Back up the stopped service's entire data directory and keep the master key separately. Histories and prompts are private local data, not encrypted-at-rest by this application; use encrypted disks/backups. Run only one process per data directory. PocketBase schema administration and host access are trusted roles.
 

@@ -201,6 +201,24 @@ func (f Factory) Open(ctx context.Context, c domain.Config) (domain.Transport, e
 		t.Close()
 		return nil, err
 	}
+	if state.RequestedRoom == "" && state.Paused != "" {
+		if response, e := t.invitationSync(ctx, ""); e == nil {
+			rooms := ownerInvitations(c, response)
+			if len(rooms) == 1 {
+				state.RequestedRoom = string(rooms[0])
+				if err = f.Store.UpdateState(c.ID, func(s *domain.State) error { s.RequestedRoom = state.RequestedRoom; return nil }); err != nil {
+					t.Close()
+					return nil, err
+				}
+			}
+		}
+	}
+	if state.RequestedRoom != "" {
+		if err = t.connectRequestedChat(ctx, id.RoomID(state.RequestedRoom)); err != nil {
+			t.Close()
+			return nil, err
+		}
+	}
 	if t.room == "" {
 		if state.RoomCreating {
 			t.Close()
@@ -226,10 +244,38 @@ func (f Factory) Open(ctx context.Context, c domain.Config) (domain.Transport, e
 			return nil, errors.New("room creation outcome is uncertain; do not create another room automatically")
 		}
 		t.room = created.RoomID
-		if err = f.Store.UpdateState(c.ID, func(s *domain.State) error { s.Room = string(t.room); s.RoomCreating = false; return nil }); err != nil {
+		if err = f.Store.UpdateState(c.ID, func(s *domain.State) error {
+			s.Room = string(t.room)
+			s.RoomCreating = false
+			s.AwaitingOwner = true
+			return nil
+		}); err != nil {
 			t.Close()
 			return nil, err
 		}
+	}
+	if state.Paused == domain.TimelineGapHold {
+		snap, e := t.Snapshot(ctx)
+		if e == nil && domain.OwnerOnly(c, string(t.room), snap) == nil {
+			if err = f.Store.UpdateState(c.ID, func(s *domain.State) error {
+				if s.Paused == domain.TimelineGapHold {
+					s.Paused = ""
+					s.SyncWarning = "Some earlier messages may be missing. Send your request again."
+				}
+				return nil
+			}); err != nil {
+				t.Close()
+				return nil, err
+			}
+		}
+	}
+	if actual, e := f.Store.Config(c.ID); e == nil && actual.Homeserver == c.Homeserver {
+		verificationCtx, verificationCancel := context.WithTimeout(ctx, 15*time.Second)
+		_ = t.verifyOwnDevice(verificationCtx)
+		verificationCancel()
+		profileCtx, profileCancel := context.WithTimeout(ctx, 10*time.Second)
+		_ = f.SyncProfile(profileCtx, c.ID)
+		profileCancel()
 	}
 	return t, nil
 }
@@ -269,6 +315,9 @@ func (t *Transport) guard(ctx context.Context) error {
 	}
 	s, err := t.Snapshot(ctx)
 	if err == nil {
+		if state.AwaitingOwner && domain.InitialInvitation(t.config, state.Room, s) {
+			return domain.ErrAwaitingOwner
+		}
 		err = domain.OwnerOnly(t.config, state.Room, s)
 	}
 	if err != nil {
@@ -370,9 +419,6 @@ func AcceptEvent(c domain.Config, room string, e *event.Event) (domain.Inbound, 
 		return domain.Inbound{}, false
 	}
 	content := e.Content.AsMessage()
-	if content.Mentions != nil && (content.Mentions.Room || len(content.Mentions.UserIDs) > 0) {
-		return domain.Inbound{}, false
-	}
 	if content.MsgType != event.MsgText || content.NewContent != nil || (content.RelatesTo != nil && content.RelatesTo.Type == event.RelReplace) {
 		return domain.Inbound{}, false
 	}

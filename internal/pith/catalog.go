@@ -25,7 +25,12 @@ type CatalogModel struct {
 	Thinking        []string `json:"thinking"`
 	DefaultThinking string   `json:"default_thinking"`
 }
+type CatalogAuth struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
 type CatalogProvider struct {
+	Auth         []CatalogAuth  `json:"auth"`
 	ID           string         `json:"id"`
 	Name         string         `json:"name"`
 	Models       []CatalogModel `json:"models"`
@@ -43,10 +48,16 @@ func ThinkingLevels(model aitypes.Model) []string {
 func ProviderCatalog() []CatalogProvider {
 	result := []CatalogProvider{}
 	for _, provider := range Catalog().GetProviders() {
-		if provider.Auth().APIKey == nil {
+		if provider.Auth().APIKey == nil && provider.Auth().OAuth == nil {
 			continue
 		}
 		p := CatalogProvider{ID: provider.ID(), Name: provider.Name(), DefaultModel: codingagent.DefaultModelPerProvider[provider.ID()], Models: []CatalogModel{}}
+		if provider.Auth().OAuth != nil {
+			p.Auth = append(p.Auth, CatalogAuth{ID: "oauth", Name: provider.Auth().OAuth.Name})
+		}
+		if provider.Auth().APIKey != nil {
+			p.Auth = append(p.Auth, CatalogAuth{ID: "api_key", Name: "API key"})
+		}
 		for _, m := range Catalog().GetModels(provider.ID()) {
 			if !strings.HasPrefix(m.BaseUrl, "https://") || strings.ContainsAny(m.BaseUrl, "{}") {
 				continue
@@ -61,6 +72,7 @@ func ProviderCatalog() []CatalogProvider {
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	for _, p := range []CatalogProvider{{ID: "custom-openai", Name: "OpenAI-compatible service", Custom: true}, {ID: "custom-responses", Name: "OpenAI Responses-compatible service", Custom: true}, {ID: "custom-anthropic", Name: "Anthropic-compatible service", Custom: true}} {
 		p.Models = []CatalogModel{}
+		p.Auth = []CatalogAuth{{ID: "api_key", Name: "API key"}}
 		result = append(result, p)
 	}
 	return result

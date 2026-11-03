@@ -20,28 +20,7 @@ func (m Model) summaryStream(ctx context.Context, key string) agenttypes.StreamF
 		opts.MaxRetries = &retries
 		stream := m.Stream
 		if stream == nil {
-			switch model.Api {
-			case aitypes.ApiOpenAICompletions:
-				stream = api.OpenAICompletionsStreamSimple
-			case aitypes.ApiOpenAIResponses:
-				stream = api.OpenAIResponsesStreamSimple
-			case aitypes.ApiOpenAICodexResponses:
-				stream = api.OpenAICodexResponsesStreamSimple
-			case aitypes.ApiAzureOpenAIResponses:
-				stream = api.AzureOpenAIResponsesStreamSimple
-			case aitypes.ApiAnthropicMessages:
-				stream = api.AnthropicMessagesStreamSimple
-			case aitypes.ApiGoogleGenerativeAI:
-				stream = api.GoogleGenerativeAIStreamSimple
-			case aitypes.ApiGoogleVertex:
-				stream = api.GoogleVertexStreamSimple
-			case aitypes.ApiMistralConversations:
-				stream = api.MistralConversationsStreamSimple
-			case aitypes.ApiBedrockConverseStream:
-				stream = api.BedrockConverseStreamSimple
-			case aitypes.ApiPiMessages:
-				stream = api.PiMessagesStreamSimple
-			}
+			stream = streamForAPI(model.Api)
 		}
 		if stream == nil {
 			return nil
@@ -87,4 +66,31 @@ func (m Model) compactionPolicy(model *aitypes.Model, key, system, input string)
 			return summary, nil
 		},
 	}
+}
+
+func streamForAPI(modelAPI aitypes.Api) agenttypes.StreamFn {
+	var stream agenttypes.StreamFn
+	switch modelAPI {
+	case aitypes.ApiOpenAICompletions:
+		stream = api.OpenAICompletionsStreamSimple
+	case aitypes.ApiOpenAIResponses:
+		stream = api.OpenAIResponsesStreamSimple
+	case aitypes.ApiOpenAICodexResponses:
+		stream = api.OpenAICodexResponsesStreamSimple
+	case aitypes.ApiAzureOpenAIResponses:
+		stream = api.AzureOpenAIResponsesStreamSimple
+	case aitypes.ApiAnthropicMessages:
+		stream = api.AnthropicMessagesStreamSimple
+	case aitypes.ApiGoogleGenerativeAI:
+		stream = api.GoogleGenerativeAIStreamSimple
+	case aitypes.ApiGoogleVertex:
+		stream = api.GoogleVertexStreamSimple
+	case aitypes.ApiMistralConversations:
+		stream = api.MistralConversationsStreamSimple
+	case aitypes.ApiBedrockConverseStream:
+		stream = api.BedrockConverseStreamSimple
+	case aitypes.ApiPiMessages:
+		stream = api.PiMessagesStreamSimple
+	}
+	return stream
 }

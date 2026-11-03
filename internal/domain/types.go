@@ -45,6 +45,7 @@ type Config struct {
 	ModelAPI      string `json:"model_api"`
 	ModelProvider string `json:"model_provider,omitempty"`
 	Thinking      string `json:"thinking,omitempty"`
+	ModelAuth     string `json:"model_auth,omitempty"`
 	ContextWindow int    `json:"context_window"`
 	MaxTokens     int    `json:"max_tokens"`
 	AutoStart     bool   `json:"auto_start"`

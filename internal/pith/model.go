@@ -9,6 +9,8 @@ import (
 
 	"github.com/minifish-org/pith-post/internal/domain"
 	agenttypes "github.com/minifish-org/pith/packages/agent/types"
+	"github.com/minifish-org/pith/packages/ai"
+	authtypes "github.com/minifish-org/pith/packages/ai/auth/types"
 	aitypes "github.com/minifish-org/pith/packages/ai/types"
 	codingagent "github.com/minifish-org/pith/packages/coding-agent"
 )
@@ -19,7 +21,11 @@ If an image or file is requested and you can supply its actual bytes, you may in
 {"pith_post":[{"kind":"text","text":"A caption"},{"kind":"file","name":"note.txt","mime":"text/plain","data":"BASE64_BYTES"}]}
 Use kind "image" for PNG, JPEG, GIF, or WebP. Supply actual base64 bytes, not a path or URL. Do not claim to have read files or used tools; no tools are available. Never include a destination room or user. The host selects the authorized recipient. Keep ordinary text below 24000 UTF-8 bytes and attachments below 8 MiB each.`
 
-type Model struct{ Stream agenttypes.StreamFn }
+type Model struct {
+	Stream         agenttypes.StreamFn
+	Credentials    authtypes.CredentialStore
+	ProviderLookup func(string) ai.Provider
+}
 
 type executionError struct{ cause error }
 
@@ -40,6 +46,14 @@ func (m Model) Generate(ctx context.Context, c domain.Config, path, workspace, i
 	defer tools.CloseTools()
 	if len(tools.Names()) != 0 {
 		return nil, errors.New("chat-only tool policy violated")
+	}
+	if c.ModelAuth == "oauth" {
+		stream, oauthKey, err := m.subscriptionStream(ctx, c.ModelProvider)
+		if err != nil {
+			return nil, err
+		}
+		m.Stream = stream
+		key = oauthKey
 	}
 	if key == "" {
 		key = "local-no-key"

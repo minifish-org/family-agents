@@ -13,6 +13,7 @@ import (
 	"github.com/minifish-org/pith-post/internal/matrix"
 	"github.com/minifish-org/pith-post/internal/store"
 	"github.com/minifish-org/pith-post/internal/testutil"
+	"github.com/minifish-org/pith/packages/ai"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -24,7 +25,8 @@ type managementTest struct {
 	admin   *core.Record
 }
 
-func management(t *testing.T) managementTest {
+func management(t *testing.T) managementTest { return managementWithProvider(t, nil) }
+func managementWithProvider(t *testing.T, lookup func(string) ai.Provider) managementTest {
 	t.Helper()
 	s := testutil.Store(t)
 	m := agent.New(s, nil, nil)
@@ -33,7 +35,7 @@ func management(t *testing.T) managementTest {
 	if err != nil {
 		t.Fatal(err)
 	}
-	Admin{Manager: m, Matrix: matrix.Factory{Store: s}, PersonProfileLookup: func(context.Context, string) (matrix.PersonProfile, error) {
+	Admin{Manager: m, ProviderLookup: lookup, Matrix: matrix.Factory{Store: s}, PersonProfileLookup: func(context.Context, string) (matrix.PersonProfile, error) {
 		return matrix.PersonProfile{DisplayName: "Matrix display name"}, nil
 	}}.Register(&core.ServeEvent{App: s.App, Router: routes})
 	handler, err := routes.BuildMux()

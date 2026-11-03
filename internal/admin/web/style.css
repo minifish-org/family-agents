@@ -11,3 +11,5 @@ button.person-name{border:0;background:transparent;padding:0;min-height:44px;col
 .field textarea{width:100%;min-width:0;max-width:100%;min-height:128px;resize:vertical;border:1px solid #ced9e9;border-radius:8px;padding:10px 12px;color:var(--ink);background:white;line-height:1.5}.field textarea::placeholder{color:#8b9ab0}@media(max-width:600px){.field textarea{font-size:16px}}
 
 .model-panel{margin-top:24px}.model-panel .subtitle{font-size:13px;color:var(--muted);margin-bottom:24px}.field select{width:100%;min-width:0;border:1px solid #ced9e9;border-radius:8px;padding:10px 12px;color:var(--ink);background:white;min-height:44px}@media(max-width:600px){.field select{font-size:16px}}
+
+.provider-account{border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:22px;font-size:14px}.provider-account>.actions{margin-top:12px}.auth-progress{display:grid;gap:12px;margin-top:12px}.auth-progress .field{margin-bottom:12px}.auth-link{color:var(--blue);overflow-wrap:anywhere}.device-code{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.device-code code{font:600 20px ui-monospace,monospace;letter-spacing:2px}

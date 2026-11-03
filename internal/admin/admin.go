@@ -15,6 +15,7 @@ import (
 	"github.com/minifish-org/pith-post/internal/domain"
 	"github.com/minifish-org/pith-post/internal/matrix"
 	"github.com/minifish-org/pith-post/internal/store"
+	"github.com/minifish-org/pith/packages/ai"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -23,6 +24,8 @@ import (
 var assets embed.FS
 
 type Admin struct {
+	Logins              *providerLogins
+	ProviderLookup      func(string) ai.Provider
 	Manager             *agent.Manager
 	Matrix              matrix.Factory
 	PersonProfileLookup func(context.Context, string) (matrix.PersonProfile, error)
@@ -41,6 +44,9 @@ func decode(e *core.RequestEvent, v any) error {
 	return nil
 }
 func (a Admin) Register(e *core.ServeEvent) {
+	if a.Logins == nil {
+		a.Logins = newProviderLogins(a.Manager, a.ProviderLookup)
+	}
 	sub, _ := fs.Sub(assets, "web")
 	e.Router.GET("/{$}", func(e *core.RequestEvent) error {
 		e.Response.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
@@ -67,6 +73,11 @@ func (a Admin) Register(e *core.ServeEvent) {
 	api.DELETE("/session", a.logout)
 	api.GET("/owners", a.owners)
 	api.GET("/owners/{id}/avatar", a.personAvatar)
+	api.POST("/provider-login", a.startProviderLogin)
+	api.GET("/provider-login/{id}", a.getProviderLogin)
+	api.POST("/provider-login/{id}", a.answerProviderLogin)
+	api.DELETE("/provider-login/{id}", a.cancelProviderLogin)
+	api.POST("/provider-logout", a.logoutProvider)
 	api.GET("/model-catalog", a.modelCatalog)
 	api.GET("/model-settings", a.modelSettings)
 	api.POST("/model-settings", a.saveModelSettings)

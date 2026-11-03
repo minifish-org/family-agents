@@ -51,7 +51,7 @@ func main() {
 			return err
 		}
 		factory = matrix.Factory{Store: s}
-		manager = agent.New(s, pith.Model{}, factory.Open)
+		manager = agent.New(s, pith.Model{Credentials: s.ProviderCredentials()}, factory.Open)
 		manager.Reset = factory.Reset
 		return nil
 	})

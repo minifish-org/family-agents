@@ -63,6 +63,7 @@ func (s *Store) Init() error {
 		`CREATE INDEX IF NOT EXISTS post_runs_pending ON post_runs(agent,status,created)`,
 		`CREATE INDEX IF NOT EXISTS post_outbox_pending ON post_outbox(agent,sent)`,
 		`CREATE TABLE IF NOT EXISTS post_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, created INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS post_provider_credentials (provider TEXT PRIMARY KEY, value BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS post_connections (id TEXT PRIMARY KEY, value TEXT NOT NULL, secret BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS post_ui (admin TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(admin,name))`,
 		`CREATE TABLE IF NOT EXISTS post_sessions (id TEXT PRIMARY KEY, admin TEXT NOT NULL, auth_key TEXT NOT NULL, csrf TEXT NOT NULL, expires INTEGER NOT NULL)`,

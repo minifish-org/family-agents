@@ -22,12 +22,14 @@ type Connection struct {
 	KeySet    bool   `json:"key_set"`
 	Provider  string `json:"provider,omitempty"`
 	Thinking  string `json:"thinking,omitempty"`
+	Auth      string `json:"auth,omitempty"`
 }
 
 func (c Connection) Apply(config *domain.Config) {
 	config.Model, config.ModelURL, config.ModelAPI = c.Model, c.URL, c.API
 	config.ContextWindow, config.MaxTokens = c.Context, c.MaxTokens
 	config.ModelProvider, config.Thinking = c.Provider, c.Thinking
+	config.ModelAuth = c.Auth
 }
 
 func (c Connection) Validate() error {

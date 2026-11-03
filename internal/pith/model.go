@@ -66,7 +66,7 @@ func (m Model) Generate(ctx context.Context, c domain.Config, path, workspace, i
 		Services: codingagent.AgentSessionServices{Cwd: workspace, Manager: manager, Tools: tools, Resources: codingagent.ResourceSet{SystemPrompt: c.Prompt + "\n" + deliveryInstructions}},
 		Model:    codingagent.ModelOptions{Model: model, ThinkingLevel: thinking, APIKey: func(context.Context, string) (string, error) { return key, nil }, StreamFn: m.Stream},
 		// The pinned SDK treats reaching MaxTurns as an error, even on a final answer.
-		Policy: codingagent.RunPolicy{MaxTurns: 2, RetryAttempts: 0},
+		Policy: m.compactionPolicy(model, key, c.Prompt+"\n"+deliveryInstructions, input),
 	})
 	if err != nil {
 		return nil, errors.New("cannot initialize Pith session")

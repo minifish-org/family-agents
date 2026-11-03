@@ -67,3 +67,9 @@ Record the Tuwunel/Element/model versions and pass/fail results in your private 
 ## Delivery verification record
 
 Verified in the implementation environment (Linux amd64, Go 1.27.2): build, ordinary tests, CGO-free tests, race-detector tests, vet, and the disposable binary smoke test. A source-only staged checkout is also built/tested/smoke-tested before delivery. The redesigned UI additionally passed the disposable Chromium workflow above. These tests do not certify a live message exchange; the live checklist above remains separate.
+
+## Automatic compaction coverage
+
+`go test -tags goolm ./internal/pith` runs the real Pith SDK against synthetic append-only sessions containing long pre-existing histories. It checks threshold-triggered compaction, raw-history prefix and session-ID preservation, recent-turn retention, restart/reopen continuation, repeated compaction carrying the previous checkpoint, and output containing only the new reply. It also checks that Persona and incoming-message size count toward the reserve.
+
+Failure cases cover empty summaries, output-token truncation, provider errors, aborts, attempted tool use and cancellation; none commits a compaction checkpoint or appends the new user request to the SDK transcript. An additional disposable HTTP model double exercises the actual Pith OpenAI-compatible streaming adapter, verifies the configured key/endpoint, and observes exactly one summary request followed by one normal reply. These tests do not spend live provider credits or rewrite a real user's session.

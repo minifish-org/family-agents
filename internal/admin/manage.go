@@ -47,8 +47,9 @@ func (a Admin) createAssistant(e *core.RequestEvent) error {
 	if in.Homeserver != "" && defaults.Homeserver != "" && strings.TrimRight(in.Homeserver, "/") != strings.TrimRight(defaults.Homeserver, "/") {
 		return e.BadRequestError("All agents use the configured Matrix server.", nil)
 	}
+	in.Prompt = strings.TrimSpace(in.Prompt)
 	if in.Prompt == "" {
-		in.Prompt = "You are a helpful personal assistant. Reply in the person’s language. Be concise and honest."
+		in.Prompt = defaultPersona
 	}
 	if in.Homeserver == "" {
 		in.Homeserver = defaults.Homeserver
@@ -145,7 +146,11 @@ func (a Admin) createAssistant(e *core.RequestEvent) error {
 	if err != nil {
 		return e.BadRequestError("Could not create the assistant. Check the person, model connection, and unique Matrix account; your setup is kept.", nil)
 	}
-	return e.JSON(200, map[string]string{"id": id})
+	saved, err := a.Manager.Store.Config(id)
+	if err != nil {
+		return e.InternalServerError("Agent saved, but its configuration could not be loaded. Retry with the same form.", nil)
+	}
+	return e.JSON(200, map[string]string{"id": id, "name": saved.Name, "prompt": saved.Prompt, "appearance_revision": appearanceRevision(saved), "persona_revision": personaRevision(saved)})
 }
 func (a Admin) updateAssistant(e *core.RequestEvent) error {
 	var in struct {

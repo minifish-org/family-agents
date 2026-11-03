@@ -79,6 +79,7 @@ func (a Admin) Register(e *core.ServeEvent) {
 	api.PATCH("/assistants/{id}", a.updateAssistant)
 	api.DELETE("/assistants/{id}", a.deleteAssistant)
 	api.PATCH("/assistants/{id}/appearance", a.saveAppearance)
+	api.PATCH("/assistants/{id}/persona", a.savePersona)
 	api.GET("/assistants/{id}/avatar", a.getAvatar)
 	api.PUT("/assistants/{id}/avatar", a.putAvatar)
 	api.DELETE("/assistants/{id}/avatar", a.removeAvatar)
@@ -120,6 +121,7 @@ func (a Admin) Register(e *core.ServeEvent) {
 			ProfileError       string        `json:"profile_error"`
 			Revision           string        `json:"revision"`
 			AppearanceRevision string        `json:"appearance_revision"`
+			PersonaRevision    string        `json:"persona_revision"`
 		}
 		result := make([]view, 0, len(configs))
 		for _, c := range configs {
@@ -147,7 +149,7 @@ func (a Admin) Register(e *core.ServeEvent) {
 			if avatar == "none" {
 				avatar = ""
 			}
-			result = append(result, view{Starting: a.Manager.Starting(c.ID), Avatar: avatar, ProfilePending: c.Name != profile.AppliedName || profile.Hash != profile.AppliedHash, ProfileError: profile.Error, Config: c, State: state, Running: a.Manager.Running(c.ID), Review: review, Credentials: secrets.Password != "" || secrets.AccessToken != "", Password: secrets.Password != "", Token: secrets.AccessToken != "", Counts: counts, Draining: a.Manager.Draining(c.ID), Revision: revision(c), AppearanceRevision: appearanceRevision(c)})
+			result = append(result, view{Starting: a.Manager.Starting(c.ID), Avatar: avatar, ProfilePending: c.Name != profile.AppliedName || profile.Hash != profile.AppliedHash, ProfileError: profile.Error, Config: c, State: state, Running: a.Manager.Running(c.ID), Review: review, Credentials: secrets.Password != "" || secrets.AccessToken != "", Password: secrets.Password != "", Token: secrets.AccessToken != "", Counts: counts, Draining: a.Manager.Draining(c.ID), Revision: revision(c), AppearanceRevision: appearanceRevision(c), PersonaRevision: personaRevision(c)})
 		}
 		e.Response.Header().Set("Cache-Control", "no-store")
 		return e.JSON(200, result)

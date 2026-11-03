@@ -111,6 +111,8 @@ The product UI manages people, agents and the shared Matrix connection. It has n
 
 On upgrade, a single common existing homeserver is adopted automatically. Agents inherit the shared server and model connection; per-agent server overrides are rejected. People are configured by Matrix ID only. Their display names and avatars are read from Matrix with a short cache; errors preserve cached values and explicit avatar removal clears the cached image. `GET /api/post/owners/{id}/avatar` serves the authenticated, normalized PNG. Remote MXC media is fetched only through the configured homeserver, with no browser-visible tokens or external image URLs.
 
+`PATCH /api/post/assistants/{id}/persona` accepts `prompt` and a persona-specific `revision`, updates only the system prompt, and applies from the next model turn. Empty or whitespace-only input restores the default persona. The agent does not restart and its identity, history and model remain intact.
+
 `PATCH /api/post/assistants/{id}/appearance` updates only the display name using an appearance-specific revision. `GET`, `PUT` and `DELETE /api/post/assistants/{id}/avatar` manage a private normalized image; uploads accept PNG/JPEG/GIF/WebP up to 2 MiB and 4096 × 4096 pixels. `POST /api/post/assistants/{id}/profile-sync` retries synchronization using the existing Matrix account/device. These operations never change the agent's owner, model, instructions, encryption identity or conversation.
 
 ## Restart continuity

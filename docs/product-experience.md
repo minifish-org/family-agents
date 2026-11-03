@@ -6,13 +6,13 @@ Pith Post connects people with their personal agents through encrypted Matrix DM
 
 - One Matrix server, shared by everyone.
 - People, configured with only their full Matrix ID. Names and avatars follow their Matrix profiles automatically.
-- Each person's agents, with a display name, avatar and dedicated Matrix account. Ownership and server are inherited when adding an agent.
+- Each person's agents, with a display name, avatar, Persona and dedicated Matrix account. Ownership and server are inherited when adding an agent.
 
 ## Interface
 
 The blue-and-white interface has only **People** and **Settings** navigation. Its browser icon matches the blue `p` brand mark.
 
-People is the home page. Each person's card shows their name, avatar and agents. Click their name for read-only identity details or removal. Click an agent to edit its display name and image. Do not repeat an ID when it is already the fallback name. Do not add manual person-name or avatar configuration.
+People is the home page. Each person's card shows their name, avatar and agents. Click their name for read-only identity details or removal. Click an agent to edit its display name, image and Persona. Persona defines its role, tone and instructions; blank uses the default. Edits apply from the next reply without resetting history. Do not repeat an ID when it is already the fallback name. Do not add manual person-name or avatar configuration.
 
 Settings contains the one Matrix server and Sign out. Check connection tests the saved address. Editing the address replaces that action with Save server, which checks the new connection before saving. All people and agent configurations must be removed before switching servers; the backend enforces the same requirement.
 

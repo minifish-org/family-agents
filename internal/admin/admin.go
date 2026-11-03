@@ -42,7 +42,7 @@ func decode(e *core.RequestEvent, v any) error {
 }
 func (a Admin) Register(e *core.ServeEvent) {
 	sub, _ := fs.Sub(assets, "web")
-	e.Router.GET("/", func(e *core.RequestEvent) error {
+	e.Router.GET("/{$}", func(e *core.RequestEvent) error {
 		e.Response.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 		e.Response.Header().Set("Cache-Control", "no-store")
 		e.Response.Header().Set("X-Content-Type-Options", "nosniff")

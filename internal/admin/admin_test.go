@@ -105,3 +105,18 @@ func TestManagementRequiresSuperuserAndNeverReturnsCredentials(t *testing.T) {
 		t.Fatal("embedded admin view was not served with a content security policy")
 	}
 }
+
+func TestProductEntryIsExactAndRetiredPreviewIsNotServed(t *testing.T) {
+	m := management(t)
+	for _, path := range []string{"/", "/post/", "/post/favicon.svg"} {
+		if w := m.request("GET", path, "", nil); w.Code != http.StatusOK {
+			t.Fatalf("product path %s returned %d", path, w.Code)
+		}
+	}
+	for _, path := range []string{"/preview", "/preview/", "/preview/index.html", "/unknown-product-path"} {
+		w := m.request("GET", path, "", nil)
+		if w.Code != http.StatusNotFound || w.Header().Get("Location") != "" {
+			t.Fatalf("retired or unknown path %s returned %d with location %q", path, w.Code, w.Header().Get("Location"))
+		}
+	}
+}

@@ -53,7 +53,6 @@ func (a Admin) Register(e *core.ServeEvent) {
 		}
 		return e.HTML(200, string(page))
 	})
-	e.Router.GET("/preview/", func(e *core.RequestEvent) error { return e.Redirect(302, "/") })
 	e.Router.GET("/post/{path...}", func(e *core.RequestEvent) error {
 		e.Response.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 		e.Response.Header().Set("X-Content-Type-Options", "nosniff")

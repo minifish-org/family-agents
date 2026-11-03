@@ -97,7 +97,7 @@ Use `kind: image` for PNG/JPEG/GIF/WebP. SVG and other types must be files. This
 
 With the complete stopped data directory backed up and the original master key available, replace the binary and start it against the same data directory. Initialization creates one shared connection per existing assistant using its exact model configuration and encrypted model key. It preserves original bot credentials, device, room, crypto stores, conversations, queue, and security holds. Future model edits use the shared connection rather than legacy per-agent fields. Existing discarded deliveries are recovered from their audit records and displayed as discarded rather than delivered.
 
-The root and `/post/` both serve the real embedded application. `/preview/` redirects to the root; remove any reverse-proxy static preview override when upgrading. Initial administrator provisioning remains a local CLI operation. Backups remain an operator procedure; activity currently shows the latest 100 tasks and deliveries rather than a full export.
+The root and `/post/` both serve the real embedded application. The former `/preview/` endpoint is removed and returns 404; remove any reverse-proxy static preview override when upgrading. Initial administrator provisioning remains a local CLI operation. Backups remain an operator procedure; activity currently shows the latest 100 tasks and deliveries rather than a full export.
 
 ## Owner-initiated chat reconnection
 

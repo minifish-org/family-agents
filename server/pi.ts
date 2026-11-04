@@ -89,6 +89,13 @@ type AgentRuntime = {
 };
 
 const MASK_PREFIX = "__FAMILY_STORED_SECRET_";
+const sensitiveConfigKey = (key: string) => {
+  const field = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+  return (
+    /api[-_]?key|secret|password|authorization|credential/.test(field) ||
+    /(?:^|[_-])token(?:[_-]|$)|(?:^|[_-])tokens$/.test(field)
+  );
+};
 const isObject = (value: unknown): value is Record<string, Json> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const fileHash = (path: string) =>
@@ -231,11 +238,7 @@ export class PiService {
             visit(
               child,
               `${path}/${key}`,
-              hidden ||
-                key === "headers" ||
-                /api[-_]?key|token|secret|password|authorization|credential/i.test(
-                  key,
-                ),
+              hidden || key === "headers" || sensitiveConfigKey(key),
             ),
           ]),
         );
@@ -346,16 +349,14 @@ export class PiService {
         (model) => `${model.provider}\0${model.id}`,
       ),
     );
-    return this.runtime
-      .getModels()
-      .map((model) => ({
-        provider: model.provider,
-        id: model.id,
-        name: model.name,
-        thinking_levels: getSupportedThinkingLevels(model),
-        input: model.input,
-        available: available.has(`${model.provider}\0${model.id}`),
-      }));
+    return this.runtime.getModels().map((model) => ({
+      provider: model.provider,
+      id: model.id,
+      name: model.name,
+      thinking_levels: getSupportedThinkingLevels(model),
+      input: model.input,
+      available: available.has(`${model.provider}\0${model.id}`),
+    }));
   }
 
   async providers() {

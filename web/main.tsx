@@ -821,6 +821,7 @@ function Providers({
   onChanged: () => void;
 }) {
   const [providers, setProviders] = useState<Provider[]>([]);
+  const [catalogError, setCatalogError] = useState("");
   const [json, setJson] = useState("");
   const [version, setVersion] = useState<string | number>("");
   const [busy, setBusy] = useState(false);
@@ -838,8 +839,9 @@ function Providers({
   async function loadProviders() {
     try {
       setProviders(await api<Provider[]>("/providers"));
+      setCatalogError("");
     } catch (error) {
-      setError(errorText(error));
+      setCatalogError(errorText(error));
     }
   }
   async function loadConfig() {
@@ -913,7 +915,7 @@ function Providers({
       setJson(JSON.stringify(config, null, 2));
       setCustom({ id: "", baseUrl: "", api: "openai-completions", model: "" });
       setNotice(
-        "Custom provider added to the editor. Save the configuration, then add its API key above.",
+        "Custom provider added to the editor. Save this configuration, then use Configure Provider above.",
       );
     } catch (error) {
       setError(errorText(error));
@@ -942,6 +944,7 @@ function Providers({
             onChange={(event) => setQuery(event.target.value)}
           />
         </label>
+        {catalogError && <Alert>{catalogError}</Alert>}
         <div className="provider-list">
           {providers
             .filter((provider) =>
@@ -962,130 +965,130 @@ function Providers({
         </div>
       </section>
       <section className="panel">
-        <h2>Custom Providers and Models</h2>
-        <p className="hint">
-          The native Pi configuration supports custom headers, model overrides,
-          reasoning mappings, input types, limits, pricing, sampling, and
-          compatibility options.
-        </p>
-        <details>
-          <summary>Add a Custom Provider</summary>
-          <form className="custom-provider" onSubmit={addCustom}>
+        <details className="provider-advanced">
+          <summary>Advanced Provider Configuration</summary>
+          <p className="hint">
+            For custom endpoints or model settings. Connect official providers
+            using Configure Provider or Sign In above.
+          </p>
+          <details>
+            <summary>Add a Custom Provider</summary>
+            <form className="custom-provider" onSubmit={addCustom}>
+              <label>
+                Provider ID
+                <input
+                  required
+                  pattern="[A-Za-z0-9_.-]+"
+                  value={custom.id}
+                  placeholder="my-provider"
+                  onChange={(event) =>
+                    setCustom({ ...custom, id: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                Base URL
+                <input
+                  required
+                  type="url"
+                  value={custom.baseUrl}
+                  placeholder="https://api.example.org/v1"
+                  onChange={(event) =>
+                    setCustom({ ...custom, baseUrl: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                API
+                <input
+                  list="api-types"
+                  required
+                  value={custom.api}
+                  onChange={(event) =>
+                    setCustom({ ...custom, api: event.target.value })
+                  }
+                />
+                <datalist id="api-types">
+                  <option value="openai-completions" />
+                  <option value="openai-responses" />
+                  <option value="anthropic-messages" />
+                  <option value="google-generative-ai" />
+                </datalist>
+              </label>
+              <label>
+                Model ID
+                <input
+                  required
+                  value={custom.model}
+                  placeholder="model-name"
+                  onChange={(event) =>
+                    setCustom({ ...custom, model: event.target.value })
+                  }
+                />
+              </label>
+              <button className="small secondary" disabled={loading}>
+                Add to Configuration
+              </button>
+            </form>
+          </details>
+          <form onSubmit={save}>
             <label>
-              Provider ID
-              <input
-                required
-                pattern="[A-Za-z0-9_.-]+"
-                value={custom.id}
-                placeholder="my-provider"
-                onChange={(event) =>
-                  setCustom({ ...custom, id: event.target.value })
-                }
+              Configuration JSON
+              <textarea
+                className="json-editor"
+                aria-label="Configuration JSON"
+                spellCheck={false}
+                rows={19}
+                value={json}
+                onChange={(event) => setJson(event.target.value)}
+                disabled={loading}
+                aria-describedby="native-config-help"
               />
             </label>
-            <label>
-              Base URL
-              <input
-                required
-                type="url"
-                value={custom.baseUrl}
-                placeholder="https://api.example.org/v1"
-                onChange={(event) =>
-                  setCustom({ ...custom, baseUrl: event.target.value })
-                }
-              />
-            </label>
-            <label>
-              API
-              <input
-                list="api-types"
-                required
-                value={custom.api}
-                onChange={(event) =>
-                  setCustom({ ...custom, api: event.target.value })
-                }
-              />
-              <datalist id="api-types">
-                <option value="openai-completions" />
-                <option value="openai-responses" />
-                <option value="anthropic-messages" />
-                <option value="google-generative-ai" />
-              </datalist>
-            </label>
-            <label>
-              Model ID
-              <input
-                required
-                value={custom.model}
-                placeholder="model-name"
-                onChange={(event) =>
-                  setCustom({ ...custom, model: event.target.value })
-                }
-              />
-            </label>
-            <button className="small secondary" disabled={loading}>
-              Add to Configuration
-            </button>
+            <p id="native-config-help" className="hint">
+              This editor supports all provider and model settings. Saved
+              credentials are hidden; keep their placeholders unchanged.{" "}
+              <a
+                href="/api/providers/schema"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Configuration Reference ↗
+              </a>
+            </p>
+            {error && (
+              <Alert>
+                {error}
+                {conflict && (
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          "Load the latest configuration? This replaces the JSON currently in the editor.",
+                        )
+                      )
+                        void loadConfig();
+                    }}
+                  >
+                    Reload Configuration
+                  </button>
+                )}
+              </Alert>
+            )}
+            {notice && (
+              <p className="notice" role="status">
+                {notice}
+              </p>
+            )}
+            <div className="actions">
+              <button disabled={busy || loading}>
+                {busy ? "Saving…" : "Save Provider Configuration"}
+              </button>
+            </div>
           </form>
         </details>
-        <form onSubmit={save}>
-          <label>
-            Native Pi Configuration
-            <textarea
-              className="json-editor"
-              aria-label="Native Pi Configuration"
-              spellCheck={false}
-              rows={19}
-              value={json}
-              onChange={(event) => setJson(event.target.value)}
-              disabled={loading}
-              aria-describedby="native-config-help"
-            />
-          </label>
-          <p id="native-config-help" className="hint">
-            All fields supported by the installed Pi schema can be edited here.
-            Saved secrets are masked; keep masked values unchanged to preserve
-            them.{" "}
-            <a
-              href="/api/providers/schema"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              View Installed Schema ↗
-            </a>
-          </p>
-          {error && (
-            <Alert>
-              {error}
-              {conflict && (
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={() => {
-                    if (
-                      window.confirm(
-                        "Load the latest configuration? This replaces the JSON currently in the editor.",
-                      )
-                    )
-                      void loadConfig();
-                  }}
-                >
-                  Reload Configuration
-                </button>
-              )}
-            </Alert>
-          )}
-          {notice && (
-            <p className="notice" role="status">
-              {notice}
-            </p>
-          )}
-          <div className="actions">
-            <button disabled={busy || loading}>
-              {busy ? "Saving…" : "Save Provider Configuration"}
-            </button>
-          </div>
-        </form>
       </section>
     </>
   );

@@ -67,3 +67,9 @@ Live checks cryptographically verified the unchanged original master → self-si
 The temporary application-branded DeepSeek alias was removed from deployment configuration. Its key now belongs to Pi's built-in DeepSeek provider, using the official endpoint and native catalog without custom model definitions. An isolated real SDK call using the built-in DeepSeek model returned `DEEPSEEK-OFFICIAL-OK`. The user's current global model selection was preserved. The duplicate Add API Key and Provider Setup actions were replaced with one Configure Provider action using native prompts; supported OAuth Sign In remains separate.
 
 Live desktop/mobile checks confirmed a single connected DeepSeek entry, one Configure Provider action, a masked native key prompt, successful cancellation, no browser errors or overflow, and an unchanged global model selection.
+
+## Advanced provider presentation and redaction (5 November 2026)
+
+Custom provider/model JSON is now behind a default-collapsed Advanced Provider Configuration section with a plain description of when it is needed. The full native editor and schema reference remain available. Credential matching distinguishes secret token fields from ordinary token-limit metadata: `maxTokensField` remains readable, while API keys, access/refresh tokens, token arrays, command-backed values, and custom headers remain masked. Regression checks use the real SDK configuration round trip.
+
+Live desktop/mobile checks confirmed that the editor and save controls are hidden until expanded, the complete editor and schema reference remain accessible, normal provider setup remains visible, and opening the section does not change settings. After deployment, the original owner DM still received an encrypted response and the existing device signature chain remained valid.

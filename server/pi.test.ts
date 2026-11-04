@@ -65,6 +65,11 @@ test("Pi native schema, complete configuration round trip, masking, and optimist
     config.providers.fixture.extra_supported_future_property = {
       preserve: true,
     };
+    config.providers.fixture.extraAuth = {
+      accessToken: "private-access-value",
+      refresh_token: "private-refresh-value",
+      oauthTokens: ["private-token-list-value"],
+    };
     let response = await service.saveConfig(config, service.config().version);
     assert.equal(
       existsSync(sentinel),
@@ -77,8 +82,17 @@ test("Pi native schema, complete configuration round trip, masking, and optimist
       "header-secret",
       "header-command-secret",
       "private-model-header",
+      "private-access-value",
+      "private-refresh-value",
+      "private-token-list-value",
     ])
       assert.equal(serialized.includes(secret), false);
+    assert.equal(
+      (response.config as any).providers.fixture.models[0].compat
+        .maxTokensField,
+      "max_tokens",
+      "a token-limit parameter name is ordinary model metadata, not a credential",
+    );
     assert.deepEqual(service.thinkingLevels("fixture", "fixture-model"), [
       "off",
       "low",

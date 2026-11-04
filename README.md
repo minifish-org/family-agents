@@ -29,7 +29,7 @@ For development, build the Gateway once, run `npm run dev`, and start Vite with 
 ## Configure
 
 1. Open Settings, enter the Matrix Server URL, and open Providers.
-2. Connect a built-in provider using its native API-key setup or OAuth flow. For custom providers/models, use the structured shortcut and the complete native Pi JSON editor. The linked schema is the exact schema shipped by the pinned SDK. Stored keys, tokens, and custom header values are masked and preserved when saving their placeholders.
+2. Use Configure Provider for the built-in provider's complete native API-key setup, or Sign In for a supported account authorization flow. Official services should use their built-in provider, with custom model overrides under that provider only when needed. For custom providers/models, use the structured shortcut and the complete native Pi JSON editor. The linked schema is the exact schema shipped by the pinned SDK. Stored keys, tokens, and custom header values are masked and preserved when saving their placeholders.
 3. Choose the global default model and a supported thinking level, then save Settings. All Agents use these defaults at the next turn boundary.
 4. Choose `+ Add Person` in the Person dropdown and enter their full Matrix ID. The public Matrix display name is fetched when possible; otherwise their Matrix ID is used.
 5. Create an Agent with its dedicated existing Matrix account/password, display name, optional image, and optional instructions. Use an existing encrypted one-to-one DM or invite it from its owner's Matrix client. Existing direct conversations are discovered automatically after membership and direct-state validation.

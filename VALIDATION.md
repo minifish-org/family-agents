@@ -50,7 +50,7 @@ The actual configured owner account also sent an encrypted DM to existing Dot. D
 ## Practical limits
 
 - Native OAuth flows are implemented and interactive prompt handling is tested, but a complete external-provider OAuth sign-in has not been performed with a real subscription account.
-- The current real global model is `family-deepseek / deepseek-flash`, thinking Off, configured for text input. Image transport and the actual SDK image/tool path were verified using the controlled vision fixture; production image understanding requires selecting a real image-capable global model.
+- Image transport and the actual SDK image/tool path were initially verified using a controlled vision fixture. Production image understanding depends on the selected global model's native input capabilities. Model selection and thinking level remain user-managed.
 - Automatic compaction is enabled through Pi's native settings. A real-provider conversation was not extended to its full context limit solely to force compaction.
 - Unrecoverable credentials and a second corrupt-store failure require correcting credentials/configuration or recreating the affected Agent; they remain visible Error states.
 
@@ -61,3 +61,9 @@ The initial new-room-only acceptance missed an existing-conversation regression.
 The gateway now discovers existing joined DMs only after checking the current owner/Agent pair, invite-only encryption, and direct membership evidence. It merges missing routing entries without weakening group/outsider rejection. Native signing secrets are kept separately from the crypto DB and must match the existing server identity before import and device signing.
 
 Live checks cryptographically verified the unchanged original master → self-signing → current Dot device chain. The actual pre-existing owner room received an encrypted `ORIGINAL-DM-OK` response through Pi and the configured provider; no new room or replacement device was created. Temporary owner test credentials were logged out and deleted. Regression tests cover direct evidence, group denial, and wrong signing-key rejection.
+
+## Official provider cleanup (5 November 2026)
+
+The temporary application-branded DeepSeek alias was removed from deployment configuration. Its key now belongs to Pi's built-in DeepSeek provider, using the official endpoint and native catalog without custom model definitions. An isolated real SDK call using the built-in DeepSeek model returned `DEEPSEEK-OFFICIAL-OK`. The user's current global model selection was preserved. The duplicate Add API Key and Provider Setup actions were replaced with one Configure Provider action using native prompts; supported OAuth Sign In remains separate.
+
+Live desktop/mobile checks confirmed a single connected DeepSeek entry, one Configure Provider action, a masked native key prompt, successful cancellation, no browser errors or overflow, and an unchanged global model selection.

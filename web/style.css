@@ -653,23 +653,6 @@ dialog::backdrop {
 .provider-actions .text-button {
   padding: 8px;
 }
-.key-form {
-  margin-top: 14px;
-  display: flex;
-  align-items: flex-end;
-  gap: 9px;
-}
-.key-form label {
-  flex: 1;
-  font-size: 12px;
-}
-.key-form input {
-  font-size: 12px;
-  padding: 9px 10px;
-}
-.key-form button {
-  flex-shrink: 0;
-}
 .oauth-flow {
   margin-top: 15px;
   background: #f6f9ff;
@@ -852,12 +835,6 @@ summary {
   }
   .provider-actions .small {
     font-size: 11px;
-  }
-  .key-form {
-    flex-wrap: wrap;
-  }
-  .key-form label {
-    flex-basis: 100%;
   }
   .json-editor {
     font-size: 11px;

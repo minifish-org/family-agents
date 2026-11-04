@@ -575,8 +575,6 @@ function ProviderAuth({
   provider: Provider;
   onChanged: () => void;
 }) {
-  const [showKey, setShowKey] = useState(false);
-  const [key, setKey] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [stale, setStale] = useState(false);
@@ -629,24 +627,6 @@ function ProviderAuth({
     }, 1200);
     return () => window.clearInterval(timer);
   }, [oauth?.id]);
-  async function saveKey(event: React.FormEvent) {
-    event.preventDefault();
-    setBusy("key");
-    setError("");
-    try {
-      await api(`/providers/${encodeURIComponent(provider.id)}/key`, "PUT", {
-        key,
-        version: provider.auth_version,
-      });
-      setKey("");
-      setShowKey(false);
-      onChanged();
-    } catch (error) {
-      failed(error);
-    } finally {
-      setBusy("");
-    }
-  }
   async function removeKey() {
     setBusy("remove");
     setError("");
@@ -722,26 +702,13 @@ function ProviderAuth({
       </div>
       <div className="provider-actions">
         {provider.api_key !== false && (
-          <>
-            <button
-              className="small secondary"
-              disabled={!!busy || !!oauth}
-              onClick={() => setShowKey(!showKey)}
-            >
-              {showKey
-                ? "Cancel"
-                : provider.authenticated
-                  ? "Update API Key"
-                  : "Add API Key"}
-            </button>
-            <button
-              className="small secondary"
-              disabled={!!busy || !!oauth}
-              onClick={() => void signIn("api_key")}
-            >
-              Provider Setup
-            </button>
-          </>
+          <button
+            className="small secondary"
+            disabled={!!busy || !!oauth}
+            onClick={() => void signIn("api_key")}
+          >
+            Configure Provider
+          </button>
         )}
         {provider.oauth && (
           <button
@@ -762,28 +729,11 @@ function ProviderAuth({
           </button>
         )}
       </div>
-      {showKey && (
-        <form className="key-form" onSubmit={saveKey}>
-          <label>
-            API Key
-            <input
-              required
-              type="password"
-              autoComplete="new-password"
-              value={key}
-              onChange={(event) => setKey(event.target.value)}
-              placeholder="Enter a new API key"
-            />
-          </label>
-          <button className="small" disabled={!!busy}>
-            {busy === "key" ? "Saving…" : "Save Key"}
-          </button>
-        </form>
-      )}
       {oauth && (
         <div className="oauth-flow">
           <p>
-            {oauth.instructions || "Complete the provider sign-in to continue."}
+            {oauth.instructions ||
+              "Complete the provider configuration to continue."}
           </p>
           {oauth.url && /^https?:\/\//i.test(oauth.url) && (
             <a
@@ -836,7 +786,7 @@ function ProviderAuth({
             disabled={!!busy}
             onClick={() => void cancelOAuth()}
           >
-            Cancel Sign In
+            Cancel
           </button>
         </div>
       )}
@@ -1441,7 +1391,12 @@ function App() {
             setSettings(false);
           }}
         >
-          <img className="brand-mark" src={familyIcon} alt="" aria-hidden="true" />
+          <img
+            className="brand-mark"
+            src={familyIcon}
+            alt=""
+            aria-hidden="true"
+          />
           Family Agents
         </a>
         {!settings && (

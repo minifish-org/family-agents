@@ -1,5 +1,7 @@
 # Family Agents
 
+Source repository: [minifish-org/family-agents](https://github.com/minifish-org/family-agents).
+
 A small private LAN control panel for family Matrix AI agents. Pick a Person, manage their Agents, and chat with those Agents from an existing Matrix client. The control panel intentionally has no login, administrator account, roles, or chat UI. Anyone who can reach it can manage all local configuration.
 
 The application consists of one Node.js/TypeScript process (Hono, SQLite, the official Pi SDK, and a React UI) and one supervised Rust process (official matrix-rust-sdk). Tuwunel remains an independent external homeserver. No Go backend or previous runtime is required.

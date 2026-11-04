@@ -10,8 +10,11 @@ use matrix_sdk::{
     ruma::{
         OwnedRoomId, OwnedTransactionId, OwnedUserId,
         api::client::{
-            config::get_global_account_data, membership::get_member_events,
-            profile::set_avatar_url, state::get_state_event_for_key,
+            config::{get_global_account_data, set_global_account_data},
+            keys::get_keys,
+            membership::get_member_events,
+            profile::set_avatar_url,
+            state::get_state_event_for_key,
         },
         events::{
             GlobalAccountDataEventType, StateEventType,
@@ -43,6 +46,10 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
+
+use matrix_sdk_crypto::{types::SecretsBundle, vodozemac::Ed25519SecretKey};
+
+static DIRECT_UPDATES: Mutex<()> = Mutex::const_new(());
 
 const MAX_MEDIA: usize = 8 * 1024 * 1024;
 type Output = mpsc::Sender<Value>;
@@ -201,7 +208,21 @@ fn active_members(raw: &[Value], owner: &str, agent: &str) -> Result<Vec<String>
     Ok(members)
 }
 
-async fn validate_room(client: &Client, room: &Room, config: &Start) -> Result<Vec<String>> {
+fn direct_membership_evidence(members: &[Value], owner: &str, agent: &str) -> bool {
+    members.iter().any(|member| {
+        let id = member["state_key"].as_str();
+        (id == Some(owner) || id == Some(agent))
+            && (member["content"]["is_direct"] == true
+                || member["unsigned"]["prev_content"]["is_direct"] == true)
+    })
+}
+
+async fn validate_room(
+    client: &Client,
+    room: &Room,
+    config: &Start,
+    discover: bool,
+) -> Result<Vec<String>> {
     if room.state() != RoomState::Joined {
         return denied("Agent has not joined this room");
     }
@@ -215,6 +236,7 @@ async fn validate_room(client: &Client, room: &Room, config: &Start) -> Result<V
         .iter()
         .map(|raw| serde_json::from_str(raw.json().get()))
         .collect::<std::result::Result<Vec<Value>, _>>()?;
+    let direct_evidence = direct_membership_evidence(&members, &config.owner_id, &config.matrix_id);
     let members = active_members(&members, &config.owner_id, &config.matrix_id)?;
     // Key sharing uses SDK member state, so do not send while it disagrees with the server.
     let mut cached: Vec<String> = room
@@ -227,36 +249,6 @@ async fn validate_room(client: &Client, room: &Room, config: &Start) -> Result<V
     cached.dedup();
     if cached != members {
         bail!("Room membership is changing; retry after Matrix synchronization");
-    }
-    let direct = client
-        .send(get_global_account_data::v3::Request::new(
-            client
-                .user_id()
-                .context("Matrix client is not authenticated")?
-                .to_owned(),
-            GlobalAccountDataEventType::Direct,
-        ))
-        .await
-        .map_err(|error| {
-            if error.to_string().contains("M_NOT_FOUND") {
-                anyhow::Error::new(RoutingDenied(
-                    "Room is not recorded as a direct conversation with the owner",
-                ))
-            } else {
-                error.into()
-            }
-        })?;
-    let direct: Value = serde_json::from_str(direct.account_data.json().get())?;
-    if !direct
-        .get(&config.owner_id)
-        .and_then(Value::as_array)
-        .is_some_and(|rooms| {
-            rooms
-                .iter()
-                .any(|r| r.as_str() == Some(room.room_id().as_str()))
-        })
-    {
-        return denied("Room is not recorded as a direct conversation with the owner");
     }
     let join = client
         .send(get_state_event_for_key::v3::Request::new(
@@ -271,6 +263,54 @@ async fn validate_room(client: &Client, room: &Room, config: &Start) -> Result<V
     }
     if !room.latest_encryption_state().await?.is_encrypted() {
         return denied("Direct conversation must be encrypted");
+    }
+    // A direct flag is per account: existing owner DMs may only be indexed on the owner's side.
+    // Establish our own routing state only after authoritative pair/private/encryption checks.
+    let _update = DIRECT_UPDATES.lock().await;
+    let user = client
+        .user_id()
+        .context("Matrix client is not authenticated")?;
+    let response = client
+        .send(get_global_account_data::v3::Request::new(
+            user.to_owned(),
+            GlobalAccountDataEventType::Direct,
+        ))
+        .await;
+    let mut direct: Value = match response {
+        Ok(response) => serde_json::from_str(response.account_data.json().get())?,
+        Err(error) if error.to_string().contains("M_NOT_FOUND") => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let known = direct
+        .get(&config.owner_id)
+        .and_then(Value::as_array)
+        .is_some_and(|rooms| {
+            rooms
+                .iter()
+                .any(|id| id.as_str() == Some(room.room_id().as_str()))
+        });
+    if !known {
+        if !discover || !direct_evidence {
+            return denied("Room is not recorded as a direct conversation with the owner");
+        }
+        let map = direct
+            .as_object_mut()
+            .context("Invalid Matrix direct-message account data")?;
+        let rooms = map
+            .entry(config.owner_id.clone())
+            .or_insert_with(|| json!([]));
+        rooms
+            .as_array_mut()
+            .context("Invalid Matrix direct-message room list")?
+            .push(json!(room.room_id()));
+        client
+            .send(set_global_account_data::v3::Request::new(
+                user.to_owned(),
+                &serde_json::from_value::<matrix_sdk::ruma::events::direct::DirectEventContent>(
+                    direct,
+                )?,
+            )?)
+            .await?;
     }
     Ok(members)
 }
@@ -471,6 +511,95 @@ async fn authenticated(config: &Start) -> Result<Client> {
     }
 }
 
+fn signing_key_matches(secret: &str, public: &Value) -> bool {
+    let Ok(secret) = Ed25519SecretKey::from_base64(secret) else {
+        return false;
+    };
+    let expected = secret.public_key().to_base64();
+    public["keys"].as_object().is_some_and(|keys| {
+        keys.len() == 1
+            && keys
+                .values()
+                .any(|value| value.as_str() == Some(expected.as_str()))
+    })
+}
+
+async fn verify_identity(client: &Client, config: &Start) -> Result<()> {
+    let path = config.store_path.join("identity-secrets.json");
+    if !path.exists() {
+        client
+            .encryption()
+            .wait_for_e2ee_initialization_tasks()
+            .await;
+        client
+            .encryption()
+            .bootstrap_cross_signing_if_needed(None)
+            .await?;
+        if client
+            .encryption()
+            .cross_signing_status()
+            .await
+            .is_some_and(|status| status.is_complete())
+        {
+            // Keep the native identity separate from the crypto DB so bounded DB recovery can sign its replacement device.
+            if let Some((user, bundle)) = matrix_sdk::encryption::export_secrets_bundle_from_store(
+                config.store_path.join("sqlite"),
+                None,
+            )
+            .await?
+            {
+                if Some(user.as_ref()) != client.user_id() {
+                    bail!("Exported signing identity belongs to another account");
+                }
+                atomic_write(&path, &serde_json::to_vec(&bundle)?).await?;
+            }
+        }
+    }
+    if path.exists() {
+        let bundle: SecretsBundle = serde_json::from_slice(&tokio::fs::read(&path).await?)
+            .context("Cannot read private Matrix signing identity")?;
+        let user = client
+            .user_id()
+            .context("Matrix client is not authenticated")?;
+        let mut request = get_keys::v3::Request::new();
+        request.device_keys.insert(user.to_owned(), vec![]);
+        let keys = client.send(request).await?;
+        for (secret, public) in [
+            (&bundle.cross_signing.master_key, keys.master_keys.get(user)),
+            (
+                &bundle.cross_signing.self_signing_key,
+                keys.self_signing_keys.get(user),
+            ),
+            (
+                &bundle.cross_signing.user_signing_key,
+                keys.user_signing_keys.get(user),
+            ),
+        ] {
+            let public: Value = serde_json::from_str(
+                public
+                    .context("Matrix signing identity is missing on the server")?
+                    .json()
+                    .get(),
+            )?;
+            if !signing_key_matches(secret, &public) {
+                bail!(
+                    "Stored signing keys do not match this Matrix account. The existing identity was not replaced."
+                );
+            }
+        }
+        client.encryption().import_secrets_bundle(&bundle).await?;
+        client.encryption().request_user_identity(user).await?;
+        client
+            .encryption()
+            .get_own_device()
+            .await?
+            .context("Matrix device keys are unavailable")?
+            .verify()
+            .await?;
+    }
+    Ok(())
+}
+
 async fn start(account: &mut Account, config: Start, out: Output) -> Result<Value> {
     if account.client.is_some()
         && account
@@ -494,6 +623,7 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
     account.config = Some(config.clone());
     emit_status(&out, &config.agent_id, "starting", None);
     let client = authenticated(&config).await?;
+    verify_identity(&client, &config).await?;
     profile(&client, config.display_name.as_deref(), &config.avatar).await?;
     let pending_path = config.store_path.join("pending-events.json");
     if pending_path.exists() {
@@ -519,7 +649,7 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
             // A plain m.room.message injected into an encrypted room is never accepted.
             if event.sender.as_str() != config.owner_id || encryption.is_none() { return; }
             let process = async {
-                let members = match validate_room(&room.client(), &room, &config).await {
+                let members = match validate_room(&room.client(), &room, &config, true).await {
                     Ok(members) => members,
                     Err(error) if error.is::<RoutingDenied>() => return Ok(()),
                     Err(error) => return Err(error),
@@ -596,6 +726,25 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
                         tokio::time::sleep(Duration::from_secs((1u64 << failures.min(5)).min(30)))
                             .await;
                         continue;
+                    }
+                    for room in task_client.joined_rooms() {
+                        let candidate = room.members(RoomMemberships::ACTIVE).await;
+                        if let Ok(members) = candidate
+                            && members.len() == 2
+                            && members
+                                .iter()
+                                .any(|m| m.user_id().as_str() == task_config.owner_id)
+                            && let Err(error) =
+                                validate_room(&task_client, &room, &task_config, true).await
+                            && !error.is::<RoutingDenied>()
+                        {
+                            emit_status(
+                                &task_out,
+                                &task_config.agent_id,
+                                "reconnecting",
+                                Some(format!("Cannot discover owner conversation: {error}")),
+                            );
+                        }
                     }
                     // Advance our cursor only after handlers have durably spooled messages.
                     if let Err(error) = atomic_write(
@@ -738,7 +887,7 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                 .parse()
                 .context("Invalid room ID")?;
             let room = client.get_room(&room_id).context("Unknown Matrix room")?;
-            let members = validate_room(client, &room, config).await?;
+            let members = validate_room(client, &room, config, false).await?;
             if op == "validate_room" {
                 return Ok(json!({"is_direct":true,"members":members,"encrypted":true}));
             }
@@ -761,7 +910,7 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                 let mut reader = std::io::Cursor::new(bytes);
                 let file = client.upload_encrypted_file(&mut reader).await?;
                 // Upload precedes a fresh membership check; uploaded bytes disclose no plaintext.
-                validate_room(client, &room, config).await?;
+                validate_room(client, &room, config, false).await?;
                 let mut info = ImageInfo::new();
                 info.mimetype = Some(mime.to_string());
                 info.size = Some((length as u32).into());
@@ -858,6 +1007,42 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_identity_requires_matching_public_keys() {
+        let key = Ed25519SecretKey::new();
+        let other = Ed25519SecretKey::new();
+        let public = json!({"keys": {"ed25519:identity": key.public_key().to_base64()}});
+        assert!(signing_key_matches(&key.to_base64(), &public));
+        assert!(!signing_key_matches(&other.to_base64(), &public));
+        assert!(!signing_key_matches("invalid", &public));
+        assert!(!signing_key_matches(&key.to_base64(), &json!({"keys":{}})));
+    }
+
+    #[test]
+    fn existing_dm_discovery_requires_direct_membership_evidence() {
+        let mut owner = member("@owner:x", "join");
+        let agent = member("@bot:x", "join");
+        assert!(!direct_membership_evidence(
+            &[owner.clone(), agent.clone()],
+            "@owner:x",
+            "@bot:x"
+        ));
+        owner["unsigned"] = json!({"prev_content":{"membership":"join","is_direct":true}});
+        assert!(direct_membership_evidence(
+            &[owner.clone(), agent.clone()],
+            "@owner:x",
+            "@bot:x"
+        ));
+        let third =
+            json!({"state_key":"@third:x","content":{"membership":"join","is_direct":true}});
+        assert!(!direct_membership_evidence(
+            &[agent.clone(), third.clone()],
+            "@owner:x",
+            "@bot:x"
+        ));
+        assert!(active_members(&[owner, agent, third], "@owner:x", "@bot:x").is_err());
+    }
     fn member(id: &str, state: &str) -> Value {
         json!({"state_key":id,"content":{"membership":state}})
     }

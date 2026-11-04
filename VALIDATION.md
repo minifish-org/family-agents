@@ -53,3 +53,11 @@ The actual configured owner account also sent an encrypted DM to existing Dot. D
 - The current real global model is `family-deepseek / deepseek-flash`, thinking Off, configured for text input. Image transport and the actual SDK image/tool path were verified using the controlled vision fixture; production image understanding requires selecting a real image-capable global model.
 - Automatic compaction is enabled through Pi's native settings. A real-provider conversation was not extended to its full context limit solely to force compaction.
 - Unrecoverable credentials and a second corrupt-store failure require correcting credentials/configuration or recreating the affected Agent; they remain visible Error states.
+
+## Existing-DM and device-verification regression (5 November 2026)
+
+The initial new-room-only acceptance missed an existing-conversation regression. The Agent-side direct index contained only the newly created test DM, and the replacement device lacked a signature from the account's existing self-signing key.
+
+The gateway now discovers existing joined DMs only after checking the current owner/Agent pair, invite-only encryption, and direct membership evidence. It merges missing routing entries without weakening group/outsider rejection. Native signing secrets are kept separately from the crypto DB and must match the existing server identity before import and device signing.
+
+Live checks cryptographically verified the unchanged original master → self-signing → current Dot device chain. The actual pre-existing owner room received an encrypted `ORIGINAL-DM-OK` response through Pi and the configured provider; no new room or replacement device was created. Temporary owner test credentials were logged out and deleted. Regression tests cover direct evidence, group denial, and wrong signing-key rejection.

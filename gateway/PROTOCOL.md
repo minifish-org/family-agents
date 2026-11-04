@@ -37,3 +37,7 @@ Command responses are `{id,ok,result}` or `{id,ok:false,error}`. Use existing de
 Temporary membership/media/network read failures replay the same sync response with bounded backoff, rather than silently dropping a valid owner's message. Policy denials (group membership, missing direct state, public or unencrypted rooms) are ignored without executing an agent.
 
 Spool events include a persisted `sequence` used for replay order, independent of event-ID ordering or equal server timestamps. Spool and cursor commits synchronize both file contents and the containing directory before delivery/advancement. A failed spool write is retried even when the event was already inserted into the in-memory map.
+
+Existing joined owner DMs are discovered after authoritative membership, SDK membership consistency, invite-only encryption, and current/previous direct-member evidence are verified. Missing Agent-side `m.direct` entries are merged against current server account data, preserving unrelated conversations. A two-member room without direct evidence is not automatically reclassified.
+
+A private SDK-native `identity-secrets.json` survives crypto-DB recovery. All three recovered signing public keys must match the server before import; the current device is then signed through the official SDK. Native signing bundles are persisted when the SDK has complete signing secrets. No account identity is silently reset.

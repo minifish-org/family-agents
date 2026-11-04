@@ -830,6 +830,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "matrix-sdk",
+ "matrix-sdk-crypto",
  "mime",
  "serde",
  "serde_json",

@@ -173,16 +173,11 @@ header {
   letter-spacing: -0.5px;
 }
 .brand-mark {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
+  flex-shrink: 0;
   width: 33px;
   height: 33px;
   border-radius: 10px;
-  color: white;
-  background: #2964d6;
-  font-size: 25px;
-  line-height: 1;
 }
 main {
   width: 100%;
@@ -770,7 +765,6 @@ summary {
   .brand-mark {
     width: 29px;
     height: 29px;
-    font-size: 23px;
   }
   header > .small {
     padding: 7px 10px;

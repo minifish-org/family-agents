@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
+import familyIcon from "./icon.svg";
 
 type Person = { id: string; matrix_id: string; display_name: string };
 type Agent = {
@@ -1440,9 +1441,7 @@ function App() {
             setSettings(false);
           }}
         >
-          <span className="brand-mark" aria-hidden="true">
-            ✦
-          </span>
+          <img className="brand-mark" src={familyIcon} alt="" aria-hidden="true" />
           Family Agents
         </a>
         {!settings && (

@@ -1,0 +1,38 @@
+{
+  "name": "family-agents",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch server/index.ts",
+    "build": "tsc -p tsconfig.server.json && vite build && node scripts/source.mjs",
+    "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "tsx --test server/*.test.ts",
+    "start": "node dist/server/index.js",
+    "gateway:build": "cargo build --locked --release --bins --manifest-path gateway/Cargo.toml"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@hono/node-server": "2.1.6",
+    "hono": "4.13.16",
+    "proper-lockfile": "4.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typebox": "1.4.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.6",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.2.1",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  }
+}

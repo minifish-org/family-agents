@@ -1,23 +1,12 @@
-GO ?= go
-
-.PHONY: build test race vet run fmt smoke
+.PHONY: build test check dev
 build:
-	CGO_ENABLED=0 $(GO) build -trimpath -tags goolm -o bin/pith-post ./cmd/pith-post
-
+	npm run build
+	cargo build --locked --release --bins --manifest-path gateway/Cargo.toml
 test:
-	$(GO) test -tags goolm ./...
-
-race:
-	CGO_ENABLED=1 $(GO) test -race -tags goolm ./...
-
-vet:
-	$(GO) vet -tags goolm ./...
-
-run: build
-	./bin/pith-post serve --http=127.0.0.1:8090 --dir=./data
-
-smoke: build
-	python3 scripts/smoke.py ./bin/pith-post
-
-fmt:
-	gofmt -w cmd internal
+	npm test
+	cargo test --locked --manifest-path gateway/Cargo.toml
+check:
+	npm run check
+	cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+dev:
+	npm run dev

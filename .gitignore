@@ -1,8 +1,6 @@
-/pb_data/
+/node_modules/
+/dist/
 /data/
-/bin/
-/.cache/
-/.scratch/
+/gateway/target/
 /.env
 *.key
-*.recovery

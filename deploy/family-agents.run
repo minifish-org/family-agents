@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv sh
+set -eu
+umask 077
+cd /config/work/pith-post
+export DATA_DIR=/config/work/pith-post/data
+export HOST=127.0.0.1
+export PORT=18090
+exec /command/s6-setuidgid abc /config/.local/bin/node dist/server/index.js

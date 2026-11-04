@@ -1097,6 +1097,7 @@ function Providers({
 function SettingsPage({ onBack }: { onBack: () => void }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [models, setModels] = useState<Model[]>([]);
+  const [loadingModels, setLoadingModels] = useState(true);
   const [providers, setProviders] = useState(false);
   const [busy, setBusy] = useState(false);
   const [selecting, setSelecting] = useState(false);
@@ -1105,10 +1106,14 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
   const [notice, setNotice] = useState("");
   const [conflict, setConflict] = useState(false);
   async function loadModels() {
+    setLoadingModels(true);
     try {
-      setModels(await api<Model[]>("/models"));
+      const catalog = await api<Model[]>("/models");
+      setModels(catalog.filter((model) => model.available));
     } catch (error) {
       setError(errorText(error));
+    } finally {
+      setLoadingModels(false);
     }
   }
   async function loadSettings() {
@@ -1232,25 +1237,36 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
             <select
               id="default-model"
               required
-              value={settings.model ? modelKey(settings) : ""}
-              disabled={busy}
+              value={selected ? modelKey(selected) : ""}
+              disabled={busy || loadingModels || !models.length}
               onChange={(event) => void chooseModel(event.target.value)}
             >
               <option value="" disabled>
-                Select a model
+                {loadingModels
+                  ? "Loading models…"
+                  : models.length
+                    ? "Select a model"
+                    : "Configure a provider first"}
               </option>
-              {settings.model && !selected && (
-                <option value={modelKey(settings)}>
-                  {settings.provider} / {settings.model} · unavailable
-                </option>
-              )}
               {models.map((model) => (
                 <option key={modelKey(model)} value={modelKey(model)}>
                   {model.provider} / {model.name || model.id}
-                  {!model.available ? " · credentials required" : ""}
                 </option>
               ))}
             </select>
+            {!loadingModels && !models.length && (
+              <p className="hint" role="status">
+                No models are available yet. Configure a provider above to get
+                started.
+              </p>
+            )}
+            {!loadingModels && settings.model && !selected && (
+              <p className="hint" role="status">
+                Saved model {settings.provider} / {settings.model} is
+                unavailable. Configure its provider or choose another available
+                model.
+              </p>
+            )}
           </section>
           <section className="panel">
             <h2>Advanced Configuration</h2>
@@ -1308,7 +1324,7 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
             </p>
           )}
           <div className="actions">
-            <button disabled={busy || selecting}>
+            <button disabled={busy || selecting || loadingModels || !selected}>
               {busy ? "Saving…" : "Save Settings"}
             </button>
           </div>

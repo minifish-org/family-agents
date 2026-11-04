@@ -73,3 +73,9 @@ Live desktop/mobile checks confirmed a single connected DeepSeek entry, one Conf
 Custom provider/model JSON is now behind a default-collapsed Advanced Provider Configuration section with a plain description of when it is needed. The full native editor and schema reference remain available. Credential matching distinguishes secret token fields from ordinary token-limit metadata: `maxTokensField` remains readable, while API keys, access/refresh tokens, token arrays, command-backed values, and custom headers remain masked. Regression checks use the real SDK configuration round trip.
 
 Live desktop/mobile checks confirmed that the editor and save controls are hidden until expanded, the complete editor and schema reference remain accessible, normal provider setup remains visible, and opening the section does not change settings. After deployment, the original owner DM still received an encrypted response and the existing device signature chain remained valid.
+
+## Configured-model selector (5 November 2026)
+
+The Default Model dropdown filters Pi's native catalog by actual SDK availability instead of displaying unconfigured providers. The complete registry remains available to backend configuration code. An unavailable saved choice is preserved with a clear message, and an empty list points to provider setup and disables invalid saves. Provider changes reload the available list. During this check, the native catalog contained 1,592 models, while the two connected providers supplied 46 available models.
+
+Live desktop/mobile browser checks matched the dropdown options exactly to SDK-available models, preserved the saved default, exercised the empty/unavailable state, reloaded after provider changes, included an available custom model, and verified native thinking levels. No settings were saved or changed during these checks.

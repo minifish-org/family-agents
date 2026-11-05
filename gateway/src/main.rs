@@ -22,8 +22,8 @@ use matrix_sdk::{
                 ImageInfo, MediaSource,
                 member::StrippedRoomMemberEvent,
                 message::{
-                    ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-                    RoomMessageEventContent,
+                    FileMessageEventContent, ImageMessageEventContent, MessageType,
+                    OriginalSyncRoomMessageEvent, RoomMessageEventContent,
                 },
             },
         },
@@ -331,6 +331,49 @@ fn decode_media(media: &Media) -> Result<(Vec<u8>, mime::Mime)> {
         bail!("Image exceeds the 8 MiB limit");
     }
     Ok((bytes, content_type))
+}
+
+fn document_rejection(file: &FileMessageEventContent) -> Option<&'static str> {
+    if !matches!(file.source, MediaSource::Encrypted(_)) {
+        return Some("Document attachments must be encrypted.");
+    }
+    if file
+        .info
+        .as_ref()
+        .and_then(|info| info.size)
+        .is_some_and(|size| u64::from(size) > MAX_MEDIA as u64)
+    {
+        return Some("Documents must be no larger than 8 MiB.");
+    }
+    let filename = file.filename();
+    if filename.is_empty() || filename.len() > 1024 {
+        return Some("The document filename is missing or too long.");
+    }
+    let extension = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let supported_extension = matches!(
+        extension.as_str(),
+        "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "json" | "jsonl"
+            | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "js" | "mjs"
+            | "cjs" | "jsx" | "ts" | "tsx" | "py" | "rs" | "go" | "java"
+            | "c" | "h" | "cpp" | "hpp" | "cs" | "rb" | "php" | "sh"
+            | "bash" | "sql" | "toml" | "ini" | "log" | "rst" | "tex"
+            | "pdf" | "docx" | "xlsx"
+    );
+    let mime = file.info.as_ref().and_then(|info| info.mimetype.as_deref()).unwrap_or("")
+        .split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let supported_mime = mime.starts_with("text/") || matches!(
+        mime.as_str(),
+        "application/json" | "application/ld+json" | "application/x-ndjson"
+            | "application/jsonl" | "application/xml" | "application/yaml"
+            | "application/x-yaml" | "application/javascript" | "application/x-javascript"
+            | "application/pdf"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    if !supported_extension && !supported_mime {
+        return Some("Unsupported document. Send text, source code, PDF, DOCX, or XLSX.");
+    }
+    None
 }
 
 fn unsupported_profile_delete(error: &str) -> bool {
@@ -665,6 +708,20 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
                         let bytes = room.client().media().get_file(image, false).await?.context("Image has no media source")?;
                         if bytes.len() > MAX_MEDIA { return Ok(()); }
                         message["media"] = json!({"data":BASE64.encode(&bytes),"mime_type":mime,"filename":image.body});
+                    },
+                    MessageType::File(file) => {
+                        message["body"] = json!(file.caption().unwrap_or(""));
+                        if let Some(reason) = document_rejection(file) {
+                            message["rejected"] = json!(reason);
+                        } else {
+                            let bytes = room.client().media().get_file(file, false).await?.context("Document has no media source")?;
+                            if bytes.len() > MAX_MEDIA {
+                                message["rejected"] = json!("Documents must be no larger than 8 MiB.");
+                            } else {
+                                let mime = file.info.as_ref().and_then(|info| info.mimetype.as_deref()).unwrap_or("application/octet-stream");
+                                message["document"] = json!({"data":BASE64.encode(&bytes),"mime_type":mime,"filename":file.filename()});
+                            }
+                        }
                     },
                     _ => return Ok(()),
                 }
@@ -1139,6 +1196,43 @@ mod tests {
             })
             .is_ok()
         );
+    }
+    #[test]
+    fn documents_require_encrypted_sources_supported_formats_and_bounded_size() {
+        let content = |filename: &str, mime_type: &str, size: usize| {
+            serde_json::from_value::<FileMessageEventContent>(json!({
+                "body": filename,
+                "file": {
+                    "url": "mxc://example.org/document",
+                    "key": {"kty":"oct","key_ops":["encrypt","decrypt"],"alg":"A256CTR","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ext":true},
+                    "iv": "AAAAAAAAAAAAAAAAAAAAAA",
+                    "hashes": {"sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+                    "v": "v2"
+                },
+                "info": {"mimetype":mime_type,"size":size}
+            })).unwrap()
+        };
+        for (filename, mime_type) in [
+            ("notes.txt", "text/plain"),
+            ("table.csv", "text/csv"),
+            ("source.rs", "application/octet-stream"),
+            ("report.pdf", "application/pdf"),
+            ("report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ("table.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ] {
+            assert_eq!(document_rejection(&content(filename, mime_type, MAX_MEDIA)), None);
+        }
+        let mut unencrypted = content("notes.txt", "text/plain", 3);
+        unencrypted.source = MediaSource::Plain("mxc://example.org/plain".try_into().unwrap());
+        assert_eq!(document_rejection(&unencrypted), Some("Document attachments must be encrypted."));
+        assert_eq!(document_rejection(&content("notes.txt", "text/plain", MAX_MEDIA + 1)), Some("Documents must be no larger than 8 MiB."));
+        assert_eq!(document_rejection(&content("archive.zip", "application/zip", 3)), Some("Unsupported document. Send text, source code, PDF, DOCX, or XLSX."));
+        assert!(document_rejection(&content("", "text/plain", 3)).is_some());
+        let mut captioned = content("report.pdf", "application/pdf", 3);
+        captioned.body = "Summarize this report.".into();
+        captioned.filename = Some("report.pdf".into());
+        assert_eq!(captioned.caption(), Some("Summarize this report."));
+        assert_eq!(captioned.filename(), "report.pdf");
     }
     #[test]
     fn controlled_recovery_only_for_local_corruption() {

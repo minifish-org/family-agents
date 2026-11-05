@@ -8,7 +8,7 @@ const roots = [
   "InitializeParams", "InitializeResponse",
   ...[
     "ModelListParams", "ModelListResponse", "ThreadStartParams", "ThreadStartResponse",
-    "ThreadResumeParams", "ThreadResumeResponse", "TurnStartParams", "TurnStartResponse",
+    "ThreadResumeParams", "ThreadResumeResponse", "ThreadForkParams", "ThreadForkResponse", "TurnStartParams", "TurnStartResponse",
     "TurnInterruptParams", "TurnInterruptResponse", "ThreadItem", "Turn",
     "GetAccountParams", "GetAccountResponse", "LoginAccountParams", "LoginAccountResponse",
     "LogoutAccountResponse", "CancelLoginAccountParams", "CancelLoginAccountResponse",

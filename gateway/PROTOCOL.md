@@ -13,7 +13,9 @@ Every stdin/stdout line is one JSON object with `v:1`. Stdout contains only prot
 - `ack_event`: `event_id`; acknowledges durable Node inbox storage. Unacknowledged messages replay on startup, in durable gateway arrival order.
 - `shutdown`: stops all clients and exits after acknowledging.
 
-Unsolicited events: `{v:1,event:"status",agent_id,status,error?}` and `{v:1,event:"message",agent_id,room_id,event_id,timestamp,sender,body,is_direct:true,members:[...],media?:{data,mime_type,filename}}`.
+Unsolicited events: `{v:1,event:"status",agent_id,status,error?}` and `{v:1,event:"message",agent_id,room_id,event_id,timestamp,sender,body,is_direct:true,members:[...],media?:{data,mime_type,filename},document?:{data,mime_type,filename},rejected?:string}`.
+
+Inbound `m.file` documents must have an encrypted media source. After authoritative owner/DM checks, the SDK downloads and decrypts supported text, source-code, PDF, DOCX, and XLSX attachments; declared and downloaded sizes may not exceed 8 MiB. `body` contains the file caption when present, and `document.filename` retains the original filename. Unsupported, unencrypted, or oversized files emit a bounded `rejected` reason without document bytes, so Node durably acknowledges the event and exposes the limitation instead of silently dropping it. Download failures retain the existing sync retry behavior. Node validates documents again and extracts bounded text before invoking either runtime; it never passes a local file path to the model. Outbound media remains encrypted images.
 
 Only owner messages in encrypted, currently joined one-to-one rooms recorded in Matrix `m.direct` are emitted. Invite handling requires the owner to invite the agent to a private room containing only these two identities. The gateway marks validated invitations as direct. Membership and direct state are rechecked before inbound delivery and every outbound request. Application-level event deduplication, durable inbox/outbox and per-agent serialization remain Node responsibilities.
 

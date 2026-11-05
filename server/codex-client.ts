@@ -73,29 +73,39 @@ export class CodexClient extends EventEmitter {
   private arguments() {
     const disabled = [
       "shell_tool", "shell_snapshot", "view_image", "browser_use", "browser_use_external",
-      "computer_use", "image_generation", "apps", "plugins", "remote_plugin", "multi_agent",
-      "hooks", "code_mode", "code_mode_host", "memories", "skill_search",
+      "computer_use", "apps", "plugins", "remote_plugin", "multi_agent",
+      "hooks", "code_mode", "memories", "skill_search",
       "skill_mcp_dependency_install", "workspace_dependencies", "goals", "sleep_tool",
     ];
     return [
       "app-server", "--listen", "stdio://",
-      "-c", 'sandbox_mode="read-only"',
+      "-c", 'default_permissions="family_agent"',
+      "-c", 'permissions.family_agent.filesystem={":root"="deny"}',
+      "-c", "permissions.family_agent.network.enabled=false",
       "-c", 'approval_policy="on-request"',
       "-c", 'web_search="live"',
+      // Responses Lite invokes native tools through the isolated Code Mode host.
+      // Shell/browser/MCP discovery remain disabled; read-only permissions still apply.
+      "-c", "features.code_mode_host=true",
+      // Native image generation remains subject to the SDK's account/model gates.
+      // The new ChatGPT plan flow does not authorize that native endpoint.
+      "-c", `features.image_generation=${!this.accessToken}`,
       "-c", "project_doc_max_bytes=0",
       "-c", 'cli_auth_credentials_store="file"',
       "-c", 'shell_environment_policy.inherit="none"',
       ...disabled.flatMap((feature) => ["-c", `features.${feature}=false`]),
       "-c", "features.skip_host_skill_discovery=true",
-      ...(this.accessToken ? [
-        "-c", 'model_provider="openai_chatgpt_plan"',
-        "-c", 'model_providers.openai_chatgpt_plan.name="ChatGPT plan"',
-        "-c", 'model_providers.openai_chatgpt_plan.base_url="https://api.openai.com/v1"',
-        "-c", 'model_providers.openai_chatgpt_plan.env_key="FAMILY_CODEX_SIWC_TOKEN"',
-        "-c", 'model_providers.openai_chatgpt_plan.wire_api="responses"',
-        "-c", 'model_providers.openai_chatgpt_plan.requires_openai_auth=false',
-        "-c", 'model_providers.openai_chatgpt_plan.supports_websockets=false',
-      ] : ["-c", 'model_provider="openai"']),
+      // Saved threads retain their provider. Keep its public definition available
+      // so native resume can report a provider mismatch and fork the saved history.
+      // The credential environment variable is supplied only while SIWC is selected.
+      "-c", 'model_providers.openai_chatgpt_plan.name="ChatGPT plan"',
+      "-c", 'model_providers.openai_chatgpt_plan.base_url="https://api.openai.com/v1"',
+      "-c", 'model_providers.openai_chatgpt_plan.env_key="FAMILY_CODEX_SIWC_TOKEN"',
+      "-c", 'model_providers.openai_chatgpt_plan.wire_api="responses"',
+      "-c", 'model_providers.openai_chatgpt_plan.requires_openai_auth=false',
+      "-c", 'model_providers.openai_chatgpt_plan.supports_websockets=false',
+      "-c", 'model_providers.openai_chatgpt_plan.supports_standalone_web_search=true',
+      "-c", this.accessToken ? 'model_provider="openai_chatgpt_plan"' : 'model_provider="openai"',
     ];
   }
 
@@ -205,7 +215,11 @@ export class CodexClient extends EventEmitter {
     if (message.error) {
       // Do not expose arbitrary native/provider error bodies containing credentials or reasoning.
       const error = new Error("Codex App Server rejected the request. Check its authentication and selected model.");
-      Object.assign(error, { code: message.error.code });
+      Object.assign(error, {
+        code: message.error.code,
+        // Preserve only this documented discriminator, never arbitrary error data.
+        ...(message.error.data?.type === "modelProviderMismatch" ? { reason: "modelProviderMismatch" } : {}),
+      });
       pending.reject(error);
     } else pending.resolve(message.result);
   }

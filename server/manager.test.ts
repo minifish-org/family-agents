@@ -213,6 +213,105 @@ test("rejected attachments are acknowledged and a fresh message can continue aft
   }
 });
 
+test("encrypted documents preserve the owner's request, extract bounded text, and never replay duplicates", async () => {
+  const f = fixture();
+  try {
+    let input = "";
+    const validationsAtRun: number[] = [];
+    f.pi.run = async (...args: unknown[]) => {
+      f.calls.runs++;
+      validationsAtRun.push(f.gateway.calls.filter((call) => call.op === "validate_room").length);
+      input = args[2] as string;
+      assert.deepEqual(args[3], [], "a document must not be passed as an image");
+      return { text: "Document summary", images: [] };
+    };
+    const event = {
+      ...f.event, event_id: "$document", body: "Compare the amounts in this document.",
+      document: { data: Buffer.from("Month,Amount\nJanuary,17\nFebruary,23\n").toString("base64"), mime_type: "text/csv", filename: "monthly.csv" },
+    };
+    await f.manager.receive({ ...event, sender: "@stranger:example.org" });
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS count FROM inbox").get()!.count, 0);
+    await f.manager.receive(event);
+    await f.manager.receive(event);
+    assert.equal(f.calls.runs, 1);
+    assert.ok(input.startsWith(event.body));
+    assert.match(input, /Filename: "monthly\.csv"/);
+    assert.match(input, /untrusted source material/);
+    assert.match(input, /January,17\nFebruary,23/);
+    assert.ok(input.length <= 48_000);
+    assert.equal(f.store.db.prepare("SELECT state FROM inbox WHERE event_id='$document'").get()!.state, "done");
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 1);
+    assert.equal(validationsAtRun[0], 2,
+      "membership is checked again after extraction and before model execution");
+
+    await f.manager.receive({ ...event, event_id: "$long-document", document: { ...event.document, data: Buffer.from("The document text.\n".repeat(5000)).toString("base64") } });
+    assert.equal(f.calls.runs, 2);
+    assert.ok(input.startsWith(event.body));
+    assert.ok(input.length <= 48_000);
+    assert.match(input, /truncated/i);
+  } finally { await f.close(); }
+});
+
+test("document rejections are durably acknowledged without model execution or retaining rejected bytes", async () => {
+  const f = fixture();
+  try {
+    const cases = [
+      { event_id: "$gateway-rejected", rejected: "Unsupported document. Send text, source code, PDF, DOCX, or XLSX." },
+      { event_id: "$malformed-document", document: { data: "not-base64!", mime_type: "text/plain", filename: "notes.txt" } },
+      { event_id: "$invalid-document-shape", document: false },
+      { event_id: "$unsupported-document", document: { data: Buffer.from("binary").toString("base64"), mime_type: "application/octet-stream", filename: "archive.zip" } },
+      { event_id: "$multiple-attachments", media: { data: "aGVsbG8=", mime_type: "image/png" }, document: { data: "aGVsbG8=", mime_type: "text/plain", filename: "notes.txt" } },
+    ];
+    for (const rejected of cases) {
+      await f.manager.receive({ ...f.event, ...rejected });
+      const row = f.store.db.prepare("SELECT state,payload FROM inbox WHERE event_id=?").get(rejected.event_id)!;
+      assert.equal(row.state, "rejected");
+      const payload = JSON.parse(row.payload as string);
+      assert.deepEqual(Object.keys(payload).sort(), ["body", "rejected"]);
+      assert.equal(payload.body, "");
+      assert.equal(typeof payload.rejected, "string");
+      assert.ok(f.gateway.calls.some((call) => call.op === "ack_event" && call.args.event_id === rejected.event_id));
+    }
+    assert.equal(f.calls.runs, 0);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+  } finally { await f.close(); }
+});
+
+test("Matrix running notifications preserve Agent errors until verified runtime recovery", async () => {
+  const f = fixture();
+  try {
+    const run = f.pi.run;
+    f.pi.run = async () => { throw new Error("Saved model session cannot be resumed."); };
+    await f.manager.receive(f.event);
+    for (const status of ["running", "Running"]) {
+      f.gateway.emit("event", { event: "status", agent_id: "a", status });
+      assert.equal(f.store.agent("a").status, "Error");
+      assert.match(f.store.agent("a").error ?? "", /Saved model session/);
+    }
+    const health = await (await createApp(f.manager).request("/api/health")).json();
+    assert.equal(health.agents[0].status, "Error");
+    assert.match(health.agents[0].error, /Saved model session/);
+    f.pi.run = run;
+    await f.manager.receive({ ...f.event, event_id: "$fresh" });
+    assert.equal(f.store.agent("a").status, "Running");
+    assert.equal(f.store.agent("a").error, null);
+    assert.equal(f.store.db.prepare("SELECT state FROM inbox WHERE event_id='$one'").get()!.state, "failed");
+
+    const initializeAgent = f.pi.initializeAgent;
+    f.pi.initializeAgent = async () => { throw new Error("Reconnect the model account."); };
+    await f.manager.refreshRuntimeAgents();
+    f.gateway.emit("event", { event: "status", agent_id: "a", status: "Running" });
+    assert.equal(f.store.agent("a").status, "Error");
+    assert.match(f.store.agent("a").error ?? "", /Reconnect the model account/);
+    f.pi.initializeAgent = initializeAgent;
+    await f.manager.refreshRuntimeAgents();
+    assert.equal(f.store.agent("a").status, "Running");
+    assert.equal(f.store.agent("a").error, null);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "start").length, 0);
+    assert.equal(f.calls.runs, 1, "recovery never replays the failed earlier message");
+  } finally { await f.close(); }
+});
+
 test("stale lifecycle and configuration edits never interrupt the active Agent", async () => {
   const f = fixture();
   let entered!: () => void, release!: () => void;

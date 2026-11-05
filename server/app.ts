@@ -207,10 +207,16 @@ export function createApp(m: Manager) {
     }));
   });
   app.get("/api/codex/account", async (c) => c.json(await m.codex.account()));
+  app.post("/api/codex/auth-method", async (c) => {
+    const body = await c.req.json();
+    if (!["siwc", "codex", "apiKey"].includes(body.method))
+      throw new AppError(400, "Choose a saved Codex connection.");
+    return c.json(await m.codex.selectAuthMethod({ method: body.method, version: body.version }));
+  });
   app.post("/api/codex/login", async (c) => {
     const body = await c.req.json();
-    if (body.type !== "apiKey" && body.type !== "chatgpt")
-      throw new AppError(400, "Choose an API key or Sign In with ChatGPT.");
+    if (!["apiKey", "chatgpt", "codex", "codexDeviceCode"].includes(body.type))
+      throw new AppError(400, "Choose Sign in with ChatGPT, Codex Native Login, or an API key.");
     return c.json(await m.codex.login({
       type: body.type, version: body.version,
       ...(body.type === "chatgpt" ? {

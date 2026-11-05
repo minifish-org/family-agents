@@ -52,18 +52,26 @@ type OAuth = {
 };
 type Avatar = { data: string; mime_type: string };
 type RuntimeDefaults = Pick<Settings, "provider" | "model" | "thinking_level">;
+type CodexAuthMethod = "siwc" | "codex" | "apiKey";
+type CodexIdentity = { type: string; email?: string | null; planType?: string };
 type CodexAccount = {
   version: string;
   authenticated: boolean;
-  auth_method?: "siwc" | "apiKey" | "legacy" | null;
+  auth_method?: CodexAuthMethod | null;
+  selected_auth_method?: CodexAuthMethod;
+  connections?: Partial<Record<CodexAuthMethod, { configured: boolean; account?: CodexIdentity | null }>>;
   can_reauthorize?: boolean;
   registrations?: { id: string; clientId?: string; email?: string; active?: boolean; selected?: boolean }[];
-  account: { type: string; email?: string; planType?: string } | null;
+  account: CodexIdentity | null;
   login?: {
     status: "pending" | "complete" | "error" | "cancelled";
     loginId?: string;
+    method?: CodexAuthMethod;
+    type?: "chatgpt" | "chatgptDeviceCode";
     prompt?: "callback_url";
     authUrl?: string;
+    verificationUrl?: string;
+    userCode?: string;
     redirectUri?: string;
     error?: string;
   };
@@ -1117,6 +1125,7 @@ function CodexAuthentication({ onChanged, disabled }: {
   disabled: boolean;
 }) {
   const [account, setAccount] = useState<CodexAccount | null>(null);
+  const [method, setMethod] = useState<CodexAuthMethod | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [callbackUrl, setCallbackUrl] = useState("");
   const [registrationId, setRegistrationId] = useState("");
@@ -1126,7 +1135,10 @@ function CodexAuthentication({ onChanged, disabled }: {
   const [error, setError] = useState("");
   const [pending, setPending] = useState<{
     loginId: string;
+    method: CodexAuthMethod;
     url?: string;
+    verificationUrl?: string;
+    userCode?: string;
     redirectUri?: string;
   } | null>(null);
   const alive = useRef(true);
@@ -1135,7 +1147,7 @@ function CodexAuthentication({ onChanged, disabled }: {
   changed.current = onChanged;
 
   function signInError(error: unknown) {
-    const message = errorText(error);
+    const message = typeof error === "string" ? error : errorText(error);
     return /[?&](?:code|state|client_id)=/.test(message)
       ? "Sign in could not be completed. Start sign in again."
       : message;
@@ -1146,20 +1158,25 @@ function CodexAuthentication({ onChanged, disabled }: {
       const next = await api<CodexAccount>("/codex/account");
       if (!alive.current || current !== request.current) return;
       setAccount(next);
+      setMethod((selected) => selected || (next.login?.status === "pending" ? next.login.method : undefined) || next.selected_auth_method || next.auth_method || "siwc");
       if (next.authenticated && next.auth_method === "siwc" && !localStorage.getItem("family-agents.chatgpt-plan-notice"))
         setPlanNotice(true);
       setRegistrationId((selected) => selected && (selected === "new" || next.registrations?.some((item) => item.id === selected))
         ? selected : next.registrations?.find((item) => item.selected || item.active)?.id || next.registrations?.[0]?.id || "");
       if (next.login?.status === "error") setError(signInError(next.login.error || "Sign in failed. Try again."));
+      if (next.login?.status === "complete" && account?.login?.status === "pending") setError("");
       if (next.login?.status === "pending" && next.login.loginId) {
         const login = next.login;
         setPending((previous) => ({
           loginId: login.loginId!,
+          method: login.method || (login.prompt === "callback_url" ? "siwc" : "codex"),
           url: login.authUrl || (previous?.loginId === login.loginId ? previous?.url : undefined),
+          verificationUrl: login.verificationUrl || (previous?.loginId === login.loginId ? previous?.verificationUrl : undefined),
+          userCode: login.userCode || (previous?.loginId === login.loginId ? previous?.userCode : undefined),
           redirectUri: login.redirectUri || (previous?.loginId === login.loginId ? previous?.redirectUri : undefined),
         }));
       } else setPending(null);
-      if (next.authenticated) changed.current();
+      if (next.authenticated && next.login?.status !== "pending") changed.current();
     } catch (error) {
       if (alive.current && current === request.current) setError(signInError(error));
     }
@@ -1176,7 +1193,7 @@ function CodexAuthentication({ onChanged, disabled }: {
     return () => window.clearInterval(timer);
   }, [pending, account?.login?.status, busy]);
 
-  async function authenticate(type: "apiKey" | "chatgpt") {
+  async function authenticate(type: "apiKey" | "chatgpt" | "codex" | "codexDeviceCode") {
     if (!account || busy) return;
     if (type === "apiKey" && !apiKey.trim()) {
       setError("Enter an API key.");
@@ -1190,21 +1207,43 @@ function CodexAuthentication({ onChanged, disabled }: {
       const result = await api<{
         type: string;
         loginId?: string;
+        method?: CodexAuthMethod;
         authUrl?: string;
+        verificationUrl?: string;
+        userCode?: string;
         redirectUri?: string;
       }>("/codex/login", "POST", {
         type,
         version: account.version,
-        ...(type === "apiKey" ? { apiKey } : {
+        ...(type === "apiKey" ? { apiKey } : type === "chatgpt" ? {
           newAccount: registrationId === "new",
           ...(registrationId && registrationId !== "new" ? { registrationId } : {}),
-        }),
+        } : {}),
       });
       if (!alive.current) return;
       setApiKey("");
       if (result.loginId)
-        setPending({ loginId: result.loginId, url: result.authUrl, redirectUri: result.redirectUri });
+        setPending({ loginId: result.loginId, method: result.method || (type === "chatgpt" ? "siwc" : "codex"), url: result.authUrl, verificationUrl: result.verificationUrl, userCode: result.userCode, redirectUri: result.redirectUri });
       await refresh();
+    } catch (error) {
+      if (alive.current) {
+        setError(signInError(error));
+        if (error instanceof ApiError && error.status === 409) void refresh();
+      }
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  }
+  async function useConnection() {
+    if (!account || !method || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api("/codex/auth-method", "POST", { method, version: account.version });
+      if (!alive.current) return;
+      await refresh();
+      setNotice("Active connection updated.");
       changed.current();
     } catch (error) {
       if (alive.current) {
@@ -1216,7 +1255,7 @@ function CodexAuthentication({ onChanged, disabled }: {
     }
   }
   async function completeSignIn() {
-    if (!account || !pending || busy || !callbackUrl.trim()) return;
+    if (!account || !pending || pending.method !== "siwc" || busy || !callbackUrl.trim()) return;
     const address = callbackUrl.trim();
     setCallbackUrl("");
     setBusy(true);
@@ -1269,70 +1308,115 @@ function CodexAuthentication({ onChanged, disabled }: {
       if (alive.current) setBusy(false);
     }
   }
-  let loginUrl: string | undefined;
-  try {
-    const url = new URL(pending?.url || "");
-    if (url.protocol === "https:" && url.hostname === "auth.openai.com" && !url.username && !url.password) loginUrl = url.href;
-  } catch {}
+  function safeLoginUrl(address?: string) {
+    try {
+      const url = new URL(address || "");
+      if (url.protocol === "https:" && url.hostname === "auth.openai.com" && !url.username && !url.password) return url.href;
+    } catch {}
+    return undefined;
+  }
+  const loginUrl = safeLoginUrl(pending?.url);
+  const verificationUrl = safeLoginUrl(pending?.verificationUrl);
   const waiting = !!pending || account?.login?.status === "pending";
   const locked = busy || disabled || !account;
+  const activeMethod = account?.auth_method;
+  const selectedMethod = method || "siwc";
+  const methodLabels: Record<CodexAuthMethod, string> = {
+    siwc: "Sign in with ChatGPT (New)",
+    codex: "Codex Native Login",
+    apiKey: "API Key",
+  };
+  const selectedConnection = account?.connections?.[selectedMethod];
+  const selectedIsActive = account?.authenticated && activeMethod === selectedMethod;
   return (
     <section className="panel">
       <h2>Codex Authentication</h2>
       <p role="status">
         {account ? account.authenticated
-          ? `Connected${account.account?.email ? ` as ${account.account.email}` : account.account?.type === "apiKey" ? " with an API key" : " with ChatGPT"}${account.account?.planType ? ` (${account.account.planType})` : ""}.`
+          ? `Active connection: ${activeMethod ? methodLabels[activeMethod] : "ChatGPT"}${account.account?.email ? ` — ${account.account.email}` : ""}${account.account?.planType ? ` (${account.account.planType})` : ""}.`
           : "Not signed in." : error ? "Codex is unavailable." : "Checking Codex authentication…"}
       </p>
       {account?.authenticated && account.auth_method === "siwc" && <p className="hint">Using your ChatGPT plan. <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage</a>.</p>}
-      {account?.auth_method === "legacy" && <p className="hint">Reconnect ChatGPT below to use the updated sign-in.</p>}
       <div className="provider-actions">
         <button type="button" className="secondary small" disabled={busy || disabled} onClick={() => { setError(""); void refresh(); }}>Refresh Status</button>
-        {account?.authenticated && <button type="button" className="text-button" disabled={locked} onClick={() => void endAuthentication(false)}>Sign Out</button>}
+        {account?.authenticated && <button type="button" className="text-button" disabled={locked || waiting} onClick={() => void endAuthentication(false)}>Sign Out</button>}
       </div>
+      <label htmlFor="codex-auth-method">Connection Method</label>
+      <select id="codex-auth-method" value={selectedMethod} disabled={locked || waiting} onChange={(event) => {
+        setMethod(event.target.value as CodexAuthMethod);
+        setApiKey("");
+        setCallbackUrl("");
+        setError("");
+        setNotice("");
+      }}>
+        {Object.entries(methodLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+      </select>
       {waiting ? (
         <div className="oauth-flow">
-          <p role="status">Complete sign in and approve access to your ChatGPT plan in the browser. This page updates automatically.</p>
-          {loginUrl && <a className="button" href={loginUrl} target="_blank" rel="noreferrer">Open ChatGPT Sign In</a>}
-          <p className="hint">If the final browser page cannot open, copy its full address and paste it below. This also works when your browser is on another computer.</p>
-          <label>
-            Final Browser URL
-            <input type="text" autoComplete="off" autoCapitalize="off" spellCheck={false}
-              value={callbackUrl} disabled={locked || !pending}
-              placeholder={pending?.redirectUri || "Paste the complete final browser address"}
-              onChange={(event) => setCallbackUrl(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void completeSignIn(); } }} />
-          </label>
+          <p role="status">Complete {methodLabels[pending?.method || selectedMethod]} in the browser. This page updates automatically.</p>
+          {pending?.userCode ? <>
+            <p>Enter this code: <strong>{pending.userCode}</strong></p>
+            {verificationUrl && <a className="button" href={verificationUrl} target="_blank" rel="noreferrer">Open Device Sign In</a>}
+          </> : loginUrl && <a className="button" href={loginUrl} target="_blank" rel="noreferrer">Open ChatGPT Sign In</a>}
+          {pending?.method === "siwc" && <>
+            <p className="hint">If the final browser page cannot open, copy its full address and paste it below. This also works when your browser is on another computer.</p>
+            <label>
+              Final Browser URL
+              <input type="text" autoComplete="off" autoCapitalize="off" spellCheck={false}
+                value={callbackUrl} disabled={locked}
+                placeholder={pending.redirectUri || "Paste the complete final browser address"}
+                onChange={(event) => setCallbackUrl(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void completeSignIn(); } }} />
+            </label>
+          </>}
+          {pending?.method === "codex" && !pending.userCode && <p className="hint">Finish in a browser on the service computer. For a browser on another computer, cancel and use Sign In with Device Code.</p>}
           <div className="provider-actions">
-            <button type="button" className="secondary small" disabled={locked || !pending || !callbackUrl.trim()} onClick={() => void completeSignIn()}>Complete Sign In</button>
+            {pending?.method === "siwc" && <button type="button" className="secondary small" disabled={locked || !callbackUrl.trim()} onClick={() => void completeSignIn()}>Complete Sign In</button>}
             <button type="button" className="text-button" disabled={locked} onClick={() => void endAuthentication(true)}>Cancel Sign In</button>
           </div>
         </div>
       ) : (
         <>
-          {!!account?.registrations?.length && <>
-            <label htmlFor="codex-chatgpt-account">ChatGPT Account</label>
-            <select id="codex-chatgpt-account" value={registrationId} disabled={locked} onChange={(event) => setRegistrationId(event.target.value)}>
-              {account.registrations.map((item) => <option key={item.id} value={item.id}>
-                {item.email || "Saved ChatGPT account"}{account.registrations!.filter((other) => other.email === item.email).length > 1 ? ` (${(item.clientId || item.id).slice(-8)})` : ""}{account.authenticated && account.auth_method === "siwc" && (item.selected || item.active) ? " (connected)" : ""}
-              </option>)}
-              <option value="new">Another ChatGPT account or workspace</option>
-            </select>
+          {selectedConnection?.configured && <>
+            <p className="hint">{selectedIsActive ? "This connection is active." : `Saved connection${selectedConnection.account?.email ? `: ${selectedConnection.account.email}` : ""}. Choose Use Connection to activate it.`}</p>
+            {!selectedIsActive && <div className="provider-actions">
+              <button type="button" className="secondary small" disabled={locked} onClick={() => void useConnection()}>Use Connection</button>
+            </div>}
           </>}
-          <div className="provider-actions">
-            <button type="button" className="secondary small" data-oai-siwc-button="" disabled={locked} onClick={() => void authenticate("chatgpt")}>Continue with ChatGPT</button>
-          </div>
-          <p className="hint">Authorize requests using your ChatGPT plan. This connection does not grant access to your ChatGPT conversations.</p>
-          <label className="codex-key">
-            API Key
-            <input type="password" autoComplete="off" value={apiKey} disabled={locked}
-              onChange={(event) => setApiKey(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void authenticate("apiKey"); } }}
-              placeholder="Enter an OpenAI API key" />
-          </label>
-          <div className="provider-actions">
-            <button type="button" className="secondary small" disabled={locked || !apiKey.trim()} onClick={() => void authenticate("apiKey")}>Save API Key</button>
-          </div>
+          {selectedMethod === "siwc" && <>
+            {!!account?.registrations?.length && <>
+              <label htmlFor="codex-chatgpt-account">ChatGPT Account</label>
+              <select id="codex-chatgpt-account" value={registrationId} disabled={locked} onChange={(event) => setRegistrationId(event.target.value)}>
+                {account.registrations.map((item) => <option key={item.id} value={item.id}>
+                  {item.email || "Saved ChatGPT account"}{account.registrations!.filter((other) => other.email === item.email).length > 1 ? ` (${(item.clientId || item.id).slice(-8)})` : ""}{account.authenticated && account.auth_method === "siwc" && (item.selected || item.active) ? " (connected)" : ""}
+                </option>)}
+                <option value="new">Another ChatGPT account or workspace</option>
+              </select>
+            </>}
+            <div className="provider-actions">
+              <button type="button" className="secondary small" data-oai-siwc-button="" disabled={locked} onClick={() => void authenticate("chatgpt")}>Continue with ChatGPT</button>
+            </div>
+            <p className="hint">Use your ChatGPT plan for conversations, calculations, time and timezone tools, and attached documents. This connection does not grant access to your ChatGPT conversations. Native web search is currently unavailable with this connection, and image generation is not supported. Use Codex Native Login for those features when your account permits them.</p>
+          </>}
+          {selectedMethod === "codex" && <>
+            <div className="provider-actions">
+              <button type="button" className="secondary small" disabled={locked} onClick={() => void authenticate("codexDeviceCode")}>Sign In with Device Code</button>
+              <button type="button" className="text-button" disabled={locked} onClick={() => void authenticate("codex")}>Sign In in Browser</button>
+            </div>
+            <p className="hint">Use device code when your browser is on another computer. This connection supports live search, public webpages, weather, market data, and image generation when your model and account permit them. Calculations and time tools are also available.</p>
+          </>}
+          {selectedMethod === "apiKey" && <>
+            <label className="codex-key">
+              API Key
+              <input type="password" autoComplete="off" value={apiKey} disabled={locked}
+                onChange={(event) => setApiKey(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void authenticate("apiKey"); } }}
+                placeholder="Enter an OpenAI API key" />
+            </label>
+            <div className="provider-actions">
+              <button type="button" className="secondary small" disabled={locked || !apiKey.trim()} onClick={() => void authenticate("apiKey")}>Save API Key</button>
+            </div>
+          </>}
         </>
       )}
       {planNotice && account?.authenticated && account.auth_method === "siwc" && <div className="oauth-flow">
@@ -1531,6 +1615,11 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
               </button>
             </section>
           ) : <CodexAuthentication onChanged={() => void loadModels("codex")} disabled={busy || changingRuntime} />}
+          <section className="panel">
+            <h2>Files in Matrix</h2>
+            <p className="hint">Send an encrypted text, code, CSV, PDF, Word (.docx), or Excel (.xlsx) attachment to your Agent. Add a message asking for a summary, comparison, or analysis. Files can be up to 8 MiB; long documents are shortened to fit the conversation.</p>
+            <p className="hint">PDFs need selectable text. Scanned pages can be sent as images for a model that supports image understanding.</p>
+          </section>
           <section className="panel">
             <h2>Default Model</h2>
             <label className="sr-only" htmlFor="default-model">

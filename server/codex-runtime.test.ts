@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -21,14 +21,24 @@ class FakeCodex extends EventEmitter implements CodexConnection {
   closes = 0;
   turnCounter = 0;
   threadCounter = 0;
+  private loadedCredential?: string;
   constructor(dir: string) {
     super();
     this.homeDir = join(dir, "codex", "home");
     this.cwd = join(dir, "codex", "workspace");
     mkdirSync(this.homeDir, { recursive: true });
     mkdirSync(this.cwd, { recursive: true });
+    writeFileSync(join(this.homeDir, "auth.json"), JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "fixture-original-key" }));
+    this.loadedCredential = readFileSync(join(this.homeDir, "auth.json"), "utf8");
   }
-  async start() {}
+  async start() {
+    const path = join(this.homeDir, "auth.json");
+    const serialized = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+    const saved = serialized ? JSON.parse(serialized) : undefined;
+    if (serialized !== this.loadedCredential) this.authenticated = !!saved;
+    this.loadedCredential = serialized;
+    if (saved) this.accountType = saved.auth_mode === "chatgpt" ? "chatgpt" : "apiKey";
+  }
   async setAccessToken(token?: string) {
     if (this.accessToken === token) return;
     this.accessToken = token; this.providerChanges.push(token); await this.close();
@@ -41,6 +51,7 @@ class FakeCodex extends EventEmitter implements CodexConnection {
     if (method === "account/read") result = { account: this.authenticated ? { type: this.accountType } : null, requiresOpenaiAuth: true };
     if (method === "model/list") result = { data: [{ id: "catalog-id", model: "codex-model", displayName: "Codex Model", supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "ultra" }], defaultReasoningEffort: "low", inputModalities: ["text", "image"], hidden: false }], nextCursor: null };
     if (method === "thread/start") result = { thread: { id: `thread-${++this.threadCounter}`, turns: [] } };
+    if (method === "thread/fork") result = { thread: { id: `thread-${++this.threadCounter}`, turns: [] }, modelProvider: params.modelProvider };
     if (method === "thread/resume") {
       if (this.rejectResume) throw new Error("Saved conversation unavailable.");
       result = { thread: { id: params.threadId, turns: [] } };
@@ -52,12 +63,16 @@ class FakeCodex extends EventEmitter implements CodexConnection {
     }
     if (method === "turn/interrupt") this.complete(params.threadId, params.turnId, "", "interrupted");
     if (method === "account/login/start") {
-      this.authenticated = true;
+      if (params.type === "apiKey") {
+        this.authenticated = true;
+        this.accountType = "apiKey";
+        writeFileSync(join(this.homeDir, "auth.json"), JSON.stringify({auth_mode: "apikey", OPENAI_API_KEY: params.apiKey}));
+      }
       result = params.type === "chatgpt" ? { type: "chatgpt", loginId: "login-1", authUrl: "https://auth.openai.com/example" }
         : params.type === "chatgptDeviceCode" ? { type: "chatgptDeviceCode", loginId: "login-1", verificationUrl: "https://auth.openai.com/codex/device", userCode: "TEST-CODE" }
         : { type: "apiKey" };
     }
-    if (method === "account/logout") this.authenticated = false;
+    if (method === "account/logout") { this.authenticated = false; if (existsSync(join(this.homeDir, "auth.json"))) unlinkSync(join(this.homeDir, "auth.json")); }
     return result as T;
   }
   notify(method: string, params: any) { this.emit("notification", method, params); }
@@ -95,7 +110,8 @@ class FakeAuthentication extends EventEmitter implements ChatGptAuthentication {
   async close() { await this.cancel(); }
 }
 const defaults = { provider: "codex", model: "codex-model", thinking_level: "ultra" };
-function fixture(options: { turnTimeoutMs?: number; interruptTimeoutMs?: number } = {}) {
+const generatedPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+function fixture(options: { turnTimeoutMs?: number; interruptTimeoutMs?: number; loginTimeoutMs?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "family-codex-runtime-"));
   const client = new FakeCodex(dir), authentication = new FakeAuthentication(), runtime = new CodexRuntime(dir, { client, authentication, ...options });
   authentication.beforeCommit = (reason) => (runtime as any).beforeCredentialCommit(reason);
@@ -105,6 +121,81 @@ async function waitFor(condition: () => boolean) {
   for (let count = 0; count < 100; count++) { if (condition()) return; await delay(1); }
   assert.fail("Expected protocol request did not arrive.");
 }
+
+test("native generated images survive early completion and are delivered once per item", async () => {
+  const f = fixture();
+  try {
+    f.client.onTurn = (params, turnId) => {
+      const item = { type: "imageGeneration", id: "generated-1", status: "completed", result: generatedPng, revisedPrompt: null, generationId: null, failure: null };
+      f.client.notify("item/completed", { threadId: params.threadId, turnId, item });
+      f.client.notify("item/completed", { threadId: params.threadId, turnId, item });
+      f.client.notify("turn/completed", { threadId: params.threadId, turn: { id: turnId, status: "completed", items: [item] } });
+    };
+    const reply = await f.runtime.run({ id: "a" }, defaults, "Draw a small image.");
+    assert.equal(reply.images.length, 1);
+    assert.equal(reply.images[0].data, generatedPng);
+    assert.equal(reply.images[0].mimeType, "image/png");
+  } finally { await f.close(); }
+});
+
+test("generated image events obey active turn ownership, cancellation, and SIWC availability", async () => {
+  const f = fixture();
+  try {
+    const a = f.runtime.run({ id: "a" }, defaults, "Draw A.");
+    const b = f.runtime.run({ id: "b" }, defaults, "Draw B.");
+    await waitFor(() => f.client.calls.filter((call) => call.method === "turn/start").length === 2);
+    const calls = f.client.calls.filter((call) => call.method === "turn/start");
+    const image = { type: "imageGeneration", id: "generated", status: "completed", result: generatedPng };
+    f.client.notify("item/completed", { threadId: calls[0].params.threadId, turnId: "turn-2", item: image });
+    f.client.notify("item/completed", { threadId: calls[1].params.threadId, turnId: "turn-2", item: image });
+    await f.runtime.stopAgent("b");
+    await assert.rejects(b, /cancelled/);
+    f.client.notify("item/completed", { threadId: calls[1].params.threadId, turnId: "turn-2", item: image });
+    f.client.complete(calls[0].params.threadId, "turn-1", "No image for A.");
+    assert.deepEqual((await a).images, []);
+    const account = await f.runtime.account();
+    await f.runtime.login({ type: "chatgpt", version: account.version });
+    await f.runtime.submitLogin({ version: (await f.runtime.account()).version, loginId: "login-1", callbackUrl: "http://127.0.0.1:1455/auth/callback" });
+    f.client.onTurn = (params, turnId) => {
+      f.client.notify("item/completed", { threadId: params.threadId, turnId, item: image });
+      f.client.complete(params.threadId, turnId, "The selected connection has no native image generation.");
+    };
+    assert.deepEqual((await f.runtime.run({ id: "a" }, defaults, "Draw again.")).images, []);
+  } finally { await f.close(); }
+});
+
+test("invalid generated bytes and untrusted artifact paths never become outbound images", async () => {
+  const f = fixture();
+  try {
+    f.client.onTurn = (params, turnId) => {
+      for (const item of [
+        { type: "imageGeneration", id: "invalid", status: "completed", result: Buffer.from("private text").toString("base64") },
+        { type: "imageGeneration", id: "private-path", status: "completed", fileId: "file", savedPath: join(f.client.homeDir, "auth.json") },
+      ]) f.client.notify("item/completed", { threadId: params.threadId, turnId, item });
+      f.client.complete(params.threadId, turnId, "Finished.");
+    };
+    const reply = await f.runtime.run({ id: "a" }, defaults, "Draw something.");
+    assert.deepEqual(reply.images, []);
+    assert.match(reply.text, /could not be delivered/);
+    assert.doesNotMatch(reply.text, /auth.json|fixture-original-key/);
+  } finally { await f.close(); }
+});
+
+test("a reply bounds generated-image count without dropping earlier valid images", async () => {
+  const f = fixture();
+  try {
+    f.client.onTurn = (params, turnId) => {
+      for (let index = 0; index < 5; index++) f.client.notify("item/completed", {
+        threadId: params.threadId, turnId,
+        item: { type: "imageGeneration", id: `image-${index}`, status: "completed", result: generatedPng },
+      });
+      f.client.complete(params.threadId, turnId, "Generated images.");
+    };
+    const reply = await f.runtime.run({ id: "a" }, defaults, "Create several images.");
+    assert.equal(reply.images.length, 4);
+    assert.match(reply.text, /could not be delivered/);
+  } finally { await f.close(); }
+});
 
 test("Codex models and reasoning levels use native metadata without Pi assumptions", async () => {
   const f = fixture();
@@ -130,11 +221,14 @@ test("early streaming completion returns final text only and preserves image inp
     assert.equal(reply.text, "Final [source](https://example.org)");
     const turn = f.client.calls.find((call) => call.method === "turn/start")!.params;
     assert.deepEqual(turn.input[1], { type: "image", url: "data:image/png;base64,aGVsbG8=" });
-    assert.deepEqual(turn.sandboxPolicy, { type: "readOnly", networkAccess: false });
+    assert.equal(turn.permissions, "family_agent");
+    assert.equal(turn.sandboxPolicy, undefined);
     const start = f.client.calls.find((call) => call.method === "thread/start")!.params;
     assert.match(start.developerInstructions, /Agent A only/);
     assert.equal(start.config.web_search, "live");
     assert.equal(start.approvalPolicy, "on-request");
+    assert.equal(start.permissions, "family_agent");
+    assert.deepEqual(start.runtimeWorkspaceRoots, [start.cwd]);
     assert.equal(start.dynamicTools[0].name, "send_image");
     const mapping = join(f.dir, "codex", "agents", "a", "thread.json");
     assert.equal(statSync(mapping).mode & 0o777, 0o600);
@@ -329,14 +423,19 @@ test("unused Agents defer thread creation until first input because empty native
   } finally { await f.close(); }
 });
 
-test("legacy ChatGPT credentials require reconnect and never authorize new turns", async () => {
+test("cached native ChatGPT credentials require explicit selection before authorizing turns", async () => {
   const f = fixture();
   try {
     f.client.accountType = "chatgpt";
+    writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-native-token"}}));
     const account = await f.runtime.account();
-    assert.equal(account.authenticated, false); assert.equal(account.auth_method, "legacy");
+    assert.equal(account.authenticated, false); assert.equal(account.auth_method, "siwc");
+    assert.equal(account.connections.codex.configured, true);
     await assert.rejects(f.runtime.run({id: "a"}, defaults, "Never legacy"), /authentication/);
     assert.equal(f.client.turnCounter, 0);
+    await f.runtime.selectAuthMethod({method: "codex", version: (await f.runtime.account()).version});
+    assert.equal((await f.runtime.account()).auth_method, "codex");
+    assert.equal((await f.runtime.account()).authenticated, true);
   } finally { await f.close(); }
 });
 
@@ -486,4 +585,284 @@ test("API-key success clears a stale SIWC login error and logout keeps it cleare
     await f.runtime.logout(account.version);
     assert.equal((await f.runtime.account()).login?.status, "cancelled");
   } finally { await f.close(); }
+});
+
+test("all three connections coexist and sign out removes only the selected credentials", async () => {
+  const f = fixture();
+  try {
+    const native = {auth_mode: "chatgpt", tokens: {access_token: "fixture-native-access", refresh_token: "fixture-native-refresh"}};
+    writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify(native));
+    f.authentication.token = "fixture-retained-siwc-token";
+    let account = await f.runtime.account();
+    assert.equal(account.selected_auth_method, "siwc");
+    assert.equal(account.connections.codex.configured, true);
+    assert.equal(existsSync(join(f.client.homeDir, "auth.json")), false, "SIWC processes cannot use a hidden native grant");
+    f.authentication.state = {status: "error", loginId: "stale-attempt"};
+    await f.runtime.selectAuthMethod({method: "codex", version: account.version});
+    assert.equal((await f.runtime.account()).login?.status, "complete");
+    assert.equal(f.authentication.token, "fixture-retained-siwc-token");
+    const rotated = {...native, tokens: {...native.tokens, refresh_token: "fixture-rotated-native-refresh"}};
+    writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify(rotated));
+    await f.runtime.login({type: "apiKey", apiKey: "fixture-new-api-key", version: (await f.runtime.account()).version});
+    account = await f.runtime.account();
+    assert.equal(account.auth_method, "apiKey");
+    assert.deepEqual(Object.values(account.connections).map((connection) => connection.configured), [true, true, true]);
+    assert.equal(f.authentication.token, "fixture-retained-siwc-token");
+    await f.runtime.selectAuthMethod({method: "codex", version: account.version});
+    assert.deepEqual(JSON.parse(readFileSync(join(f.client.homeDir, "auth.json"), "utf8")), rotated);
+    await f.runtime.selectAuthMethod({method: "siwc", version: (await f.runtime.account()).version});
+    await f.runtime.logout((await f.runtime.account()).version);
+    account = await f.runtime.account();
+    assert.equal(account.selected_auth_method, "siwc"); assert.equal(account.authenticated, false);
+    assert.deepEqual(Object.values(account.connections).map((connection) => connection.configured), [false, true, true]);
+    await f.runtime.selectAuthMethod({method: "codex", version: account.version});
+    await f.runtime.logout((await f.runtime.account()).version);
+    account = await f.runtime.account();
+    assert.equal(account.selected_auth_method, "codex"); assert.equal(account.authenticated, false);
+    assert.deepEqual(Object.values(account.connections).map((connection) => connection.configured), [false, false, true]);
+    await f.runtime.selectAuthMethod({method: "apiKey", version: account.version});
+    await f.runtime.logout((await f.runtime.account()).version);
+    account = await f.runtime.account();
+    assert.equal(account.selected_auth_method, "apiKey"); assert.equal(account.authenticated, false);
+    assert.deepEqual(Object.values(account.connections).map((connection) => connection.configured), [false, false, false]);
+    assert.equal(statSync(join(f.dir, "codex", "auth-connections")).mode & 0o777, 0o700);
+    assert.equal(statSync(join(f.dir, "codex", "auth-connections", "state.json")).mode & 0o777, 0o600);
+    assert.doesNotMatch(JSON.stringify(account), /fixture-.*(?:token|refresh|key)/);
+  } finally { await f.close(); }
+});
+
+test("saved authentication selection survives restart despite other configured connections", async () => {
+  const f = fixture(); let restarted: CodexRuntime | undefined;
+  try {
+    f.authentication.token = "fixture-siwc-token";
+    await f.runtime.account();
+    await f.runtime.login({type: "apiKey", apiKey: "fixture-selected-api-key", version: (await f.runtime.account()).version});
+    await f.runtime.close();
+    restarted = new CodexRuntime(f.dir, {client: f.client, authentication: f.authentication});
+    const account = await restarted.account();
+    assert.equal(account.selected_auth_method, "apiKey");
+    assert.equal(account.connections.siwc.configured, true);
+    assert.equal(account.authenticated, true);
+    assert.equal(statSync(join(f.dir, "codex", "auth-connections", "apiKey.json")).mode & 0o777, 0o600);
+  } finally { await restarted?.close(); await f.close(); }
+});
+
+test("native browser completion is correlated before acknowledgement and switches after its queue clears", async () => {
+  const f = fixture(); const guards: boolean[] = [];
+  f.runtime.onAuthenticationChanged = () => {guards.push((f.runtime as any).authChanging);};
+  try {
+    f.authentication.token = "fixture-preserved-siwc-token";
+    const request = f.client.request.bind(f.client);
+    f.client.request = async <T>(method: string, params?: any): Promise<T> => {
+      const result = await request<T>(method, params);
+      if (method === "account/login/start" && params.type === "chatgpt") {
+        assert.equal(existsSync(join(f.client.homeDir, "auth.json")), false, "pending native login has no old managed grant to rotate");
+        writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-new-native-token"}}));
+        f.client.authenticated = true;
+        f.client.notify("account/login/completed", {loginId: "foreign", success: false, error: "wrong flow"});
+        f.client.notify("account/login/completed", {loginId: "login-1", success: true, error: null});
+      }
+      return result;
+    };
+    const result = await f.runtime.login({type: "codex", version: (await f.runtime.account()).version});
+    assert.equal(result.method, "codex");
+    await waitFor(() => (f.runtime as any).loginState?.status === "complete");
+    await delay(1);
+    const account = await f.runtime.account();
+    assert.equal(account.auth_method, "codex"); assert.equal(account.authenticated, true);
+    assert.equal(account.login?.method, "codex"); assert.equal(account.login?.status, "complete");
+    assert.equal(f.authentication.token, "fixture-preserved-siwc-token");
+    assert.deepEqual(guards, [false]);
+    assert.equal(statSync(join(f.dir, "codex", "auth-connections", "codex.json")).mode & 0o777, 0o600);
+  } finally { await f.close(); }
+});
+
+test("native device sign in blocks turns, rejects callback paste, and cancellation restores even notFound races", async () => {
+  const f = fixture();
+  try {
+    const original = readFileSync(join(f.client.homeDir, "auth.json"), "utf8");
+    await f.runtime.login({type: "codexDeviceCode", version: (await f.runtime.account()).version});
+    let account = await f.runtime.account();
+    assert.equal(account.login?.method, "codex");
+    assert.equal((account.login as any).userCode, "TEST-CODE");
+    assert.equal((account.login as any).verificationUrl, "https://auth.openai.com/codex/device");
+    await assert.rejects(f.runtime.run({id: "a"}, defaults, "Must wait"), /Complete or cancel native Codex sign in/);
+    await assert.rejects(f.runtime.submitLogin({loginId: "login-1", callbackUrl: "http://127.0.0.1:1455/auth/callback?code=x", version: account.version}), /browser or device/);
+    f.client.notify("account/login/completed", {loginId: "unrelated", success: true});
+    await delay(1); assert.equal((await f.runtime.account()).login?.status, "pending");
+    writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "late-native-token"}}));
+    const request = f.client.request.bind(f.client);
+    f.client.request = async <T>(method: string, params?: any): Promise<T> => {
+      if (method === "account/login/cancel") {
+        f.client.notify("account/login/completed", {loginId: "login-1", success: true});
+        return {status: "notFound"} as T;
+      }
+      return request<T>(method, params);
+    };
+    await f.runtime.cancelLogin((await f.runtime.account()).version);
+    await delay(1);
+    account = await f.runtime.account();
+    assert.equal(account.selected_auth_method, "apiKey"); assert.equal(account.login?.status, "cancelled");
+    assert.equal(readFileSync(join(f.client.homeDir, "auth.json"), "utf8"), original);
+    assert.equal(account.connections.codex.configured, false);
+  } finally { await f.close(); }
+});
+
+test("native login timeout, SDK crash, and deactivation restore the previous native checkpoint", async () => {
+  for (const failure of ["timeout", "disconnect", "deactivate"] as const) {
+    const f = fixture({loginTimeoutMs: failure === "timeout" ? 5 : 1000});
+    try {
+      const original = readFileSync(join(f.client.homeDir, "auth.json"), "utf8");
+      await f.runtime.login({type: "codex", version: (await f.runtime.account()).version});
+      writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "uncommitted-native-token"}}));
+      if (failure === "disconnect") f.client.emit("disconnect", new Error("SDK exited"));
+      else if (failure === "deactivate") await f.runtime.deactivate();
+      await waitFor(() => (f.runtime as any).loginState?.status !== "pending");
+      assert.equal(readFileSync(join(f.client.homeDir, "auth.json"), "utf8"), original);
+      const account = await f.runtime.account();
+      assert.equal(account.selected_auth_method, "apiKey");
+      assert.equal(account.connections.codex.configured, false);
+      assert.equal(account.login?.status, failure === "deactivate" ? "cancelled" : "error");
+      if (failure === "timeout") assert.equal(f.client.calls.some((call) => call.method === "account/login/cancel"), true);
+    } finally { await f.close(); }
+  }
+});
+
+test("failed native start restores credentials and leaves no background callback process", async () => {
+  const f = fixture();
+  try {
+    const original = readFileSync(join(f.client.homeDir, "auth.json"), "utf8");
+    const request = f.client.request.bind(f.client);
+    f.client.request = async <T>(method: string, params?: any): Promise<T> => {
+      if (method === "account/login/start") {
+        writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-uncommitted-token"}}));
+        throw new Error("Invalid reply containing fixture-uncommitted-token");
+      }
+      return request<T>(method, params);
+    };
+    await assert.rejects(f.runtime.login({type: "codex", version: (await f.runtime.account()).version}), /Invalid reply containing \[redacted\]/);
+    assert.equal(readFileSync(join(f.client.homeDir, "auth.json"), "utf8"), original);
+    assert.equal((await f.runtime.account()).selected_auth_method, "apiKey");
+    assert.equal((f.runtime as any).nativeLogin, undefined);
+    assert.ok(f.client.closes >= 2);
+  } finally { await f.close(); }
+});
+
+test("failed saved connection selection restores the previous working provider without falling back", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-cached-native-token"}}));
+    f.authentication.token = "fixture-active-siwc-token";
+    const account = await f.runtime.account();
+    const request = f.client.request.bind(f.client);
+    f.client.request = async <T>(method: string, params?: unknown): Promise<T> => method === "account/read" ? {account: null, requiresOpenaiAuth: true} as T : request<T>(method, params);
+    await assert.rejects(f.runtime.selectAuthMethod({method: "codex", version: account.version}), /no longer authenticated/);
+    assert.equal((await f.runtime.account()).selected_auth_method, "siwc");
+    assert.equal((await f.runtime.account()).authenticated, true);
+    assert.equal(f.authentication.token, "fixture-active-siwc-token");
+    assert.equal(f.client.accessToken, undefined);
+    f.client.onTurn = (params, id) => f.client.complete(params.threadId, id, "SIWC still works");
+    assert.equal((await f.runtime.run({id: "a"}, defaults, "Continue")).text, "SIWC still works");
+    assert.equal(f.client.accessToken, "fixture-active-siwc-token");
+  } finally { await f.close(); }
+});
+
+test("search authorization failures keep SIWC selected and never replay with cached native credentials", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-native-cache"}}));
+    f.authentication.token = "fixture-active-siwc-token";
+    f.client.onTurn = (params, id) => {
+      f.client.notify("turn/completed", {threadId: params.threadId, turn: {id, status: "failed", items: [], error: {message: "Search 401: hardened_oauth_rule_missing"}}});
+    };
+    await assert.rejects(f.runtime.run({id: "a"}, defaults, "News"), /hardened_oauth_rule_missing/);
+    assert.equal((await f.runtime.account()).selected_auth_method, "siwc");
+    assert.equal((await f.runtime.account()).connections.codex.configured, true);
+    assert.equal(f.client.turnCounter, 1);
+    assert.equal(f.client.calls.some((call) => call.method === "account/login/start"), false);
+  } finally { await f.close(); }
+});
+
+test("an explicit provider switch forks saved native history without replaying prior user messages", async () => {
+  const f = fixture();
+  try {
+    f.authentication.token = "fixture-siwc-token";
+    f.client.onTurn = (params, id) => f.client.complete(params.threadId, id, "Reply");
+    await f.runtime.run({id: "a"}, defaults, "First message");
+    await f.runtime.login({type: "apiKey", apiKey: "fixture-native-key", version: (await f.runtime.account()).version});
+    const request = f.client.request.bind(f.client);
+    f.client.request = async <T>(method: string, params?: unknown): Promise<T> => {
+      if (method === "thread/resume") throw Object.assign(new Error("Provider differs"), {reason: "modelProviderMismatch"});
+      return request<T>(method, params);
+    };
+    await f.runtime.run({id: "a"}, defaults, "Second message");
+    const fork = f.client.calls.find((call) => call.method === "thread/fork")!;
+    assert.equal(fork.params.threadId, "thread-1"); assert.equal(fork.params.modelProvider, "openai");
+    assert.equal(f.client.turnCounter, 2);
+    assert.deepEqual(f.client.calls.filter((call) => call.method === "turn/start").map((call) => call.params.input[0].text), ["First message", "Second message"]);
+    const mapping = JSON.parse(readFileSync(join(f.dir, "codex", "agents", "a", "thread.json"), "utf8"));
+    assert.equal(mapping.threadId, "thread-2"); assert.equal(mapping.submitted, true);
+  } finally { await f.close(); }
+});
+
+test("native and API-key setup work when the selected SIWC credential cannot refresh", async () => {
+  for (const type of ["codex", "apiKey"] as const) {
+    const f = fixture();
+    try {
+      f.authentication.token = "fixture-expired-siwc-token";
+      f.authentication.accessToken = async () => {throw new Error("SIWC reauthorization required");};
+      let account = await f.runtime.account();
+      await assert.rejects(f.runtime.models(), /reauthorization required/);
+      await f.runtime.login({type, apiKey: "fixture-recovery-key", version: account.version});
+      if (type === "codex") {
+        assert.equal((await f.runtime.account()).selected_auth_method, "siwc");
+        writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-recovery-native-token"}}));
+        f.client.notify("account/login/completed", {loginId: "login-1", success: true});
+        await waitFor(() => (f.runtime as any).loginState?.status === "complete");
+      }
+      account = await f.runtime.account();
+      assert.equal(account.selected_auth_method, type);
+      assert.equal(account.authenticated, true);
+      assert.equal(f.authentication.token, "fixture-expired-siwc-token");
+    } finally {await f.close();}
+  }
+});
+
+test("a rejected SIWC commit keeps the selected native credentials usable", async () => {
+  const f = fixture();
+  try {
+    const original = readFileSync(join(f.client.homeDir, "auth.json"), "utf8");
+    await f.runtime.login({type: "chatgpt", version: (await f.runtime.account()).version});
+    f.authentication.submit = async () => {
+      const release = await f.authentication.beforeCommit?.("login");
+      try {throw new Error("SIWC credential commit rejected");} finally {release?.();}
+    };
+    await assert.rejects(f.authentication.submit("login-1", "http://127.0.0.1:1455/auth/callback?code=x"), /commit rejected/);
+    assert.equal(readFileSync(join(f.client.homeDir, "auth.json"), "utf8"), original);
+    assert.equal((await f.runtime.account()).selected_auth_method, "apiKey");
+    assert.equal((await f.runtime.account()).authenticated, true);
+    f.client.onTurn = (params, id) => f.client.complete(params.threadId, id, "Native remains available");
+    assert.equal((await f.runtime.run({id: "a"}, defaults, "Continue")).text, "Native remains available");
+  } finally {await f.close();}
+});
+
+test("model discovery never takes a second admission lease while SIWC completion drains its first lease", async () => {
+  const f = fixture();
+  try {
+    await f.runtime.login({type: "chatgpt", version: (await f.runtime.account()).version});
+    const readAccount = (f.runtime as any).readAccount.bind(f.runtime);
+    let completion: Promise<void> | undefined;
+    (f.runtime as any).readAccount = async (leased: boolean) => {
+      if (leased && !completion) {
+        completion = f.authentication.submit("login-1", "http://127.0.0.1:1455/auth/callback?code=x");
+        await delay(1);
+        assert.equal((f.runtime as any).authChanging, true);
+      }
+      return readAccount(leased);
+    };
+    const models = await f.runtime.models();
+    assert.equal(models[0].available, true);
+    await completion;
+    assert.equal((await f.runtime.account()).selected_auth_method, "siwc");
+  } finally {await f.close();}
 });

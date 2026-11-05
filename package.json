@@ -12,13 +12,15 @@
     "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "test": "tsx --test server/*.test.ts",
     "start": "node dist/server/index.js",
-    "gateway:build": "cargo build --locked --release --bins --manifest-path gateway/Cargo.toml"
+    "gateway:build": "cargo build --locked --release --bins --manifest-path gateway/Cargo.toml",
+    "codex:generate": "node scripts/generate-codex.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "1.5.0",
     "@earendil-works/pi-coding-agent": "1.5.0",
     "@hono/node-server": "2.1.6",
     "hono": "4.13.16",
+    "jose": "6.2.15",
     "proper-lockfile": "4.1.2",
     "react": "19.3.1",
     "react-dom": "19.3.1",

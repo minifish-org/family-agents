@@ -17,6 +17,7 @@ type Agent = {
 };
 type Settings = {
   version: number;
+  runtime: "pi" | "codex";
   homeserver: string;
   provider: string;
   model: string;
@@ -50,6 +51,23 @@ type OAuth = {
   error?: string;
 };
 type Avatar = { data: string; mime_type: string };
+type RuntimeDefaults = Pick<Settings, "provider" | "model" | "thinking_level">;
+type CodexAccount = {
+  version: string;
+  authenticated: boolean;
+  auth_method?: "siwc" | "apiKey" | "legacy" | null;
+  can_reauthorize?: boolean;
+  registrations?: { id: string; clientId?: string; email?: string; active?: boolean; selected?: boolean }[];
+  account: { type: string; email?: string; planType?: string } | null;
+  login?: {
+    status: "pending" | "complete" | "error" | "cancelled";
+    loginId?: string;
+    prompt?: "callback_url";
+    authUrl?: string;
+    redirectUri?: string;
+    error?: string;
+  };
+};
 
 class ApiError extends Error {
   constructor(
@@ -1094,6 +1112,243 @@ function Providers({
   );
 }
 
+function CodexAuthentication({ onChanged, disabled }: {
+  onChanged: () => void;
+  disabled: boolean;
+}) {
+  const [account, setAccount] = useState<CodexAccount | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [callbackUrl, setCallbackUrl] = useState("");
+  const [registrationId, setRegistrationId] = useState("");
+  const [planNotice, setPlanNotice] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState<{
+    loginId: string;
+    url?: string;
+    redirectUri?: string;
+  } | null>(null);
+  const alive = useRef(true);
+  const request = useRef(0);
+  const changed = useRef(onChanged);
+  changed.current = onChanged;
+
+  function signInError(error: unknown) {
+    const message = errorText(error);
+    return /[?&](?:code|state|client_id)=/.test(message)
+      ? "Sign in could not be completed. Start sign in again."
+      : message;
+  }
+  async function refresh() {
+    const current = ++request.current;
+    try {
+      const next = await api<CodexAccount>("/codex/account");
+      if (!alive.current || current !== request.current) return;
+      setAccount(next);
+      if (next.authenticated && next.auth_method === "siwc" && !localStorage.getItem("family-agents.chatgpt-plan-notice"))
+        setPlanNotice(true);
+      setRegistrationId((selected) => selected && (selected === "new" || next.registrations?.some((item) => item.id === selected))
+        ? selected : next.registrations?.find((item) => item.selected || item.active)?.id || next.registrations?.[0]?.id || "");
+      if (next.login?.status === "error") setError(signInError(next.login.error || "Sign in failed. Try again."));
+      if (next.login?.status === "pending" && next.login.loginId) {
+        const login = next.login;
+        setPending((previous) => ({
+          loginId: login.loginId!,
+          url: login.authUrl || (previous?.loginId === login.loginId ? previous?.url : undefined),
+          redirectUri: login.redirectUri || (previous?.loginId === login.loginId ? previous?.redirectUri : undefined),
+        }));
+      } else setPending(null);
+      if (next.authenticated) changed.current();
+    } catch (error) {
+      if (alive.current && current === request.current) setError(signInError(error));
+    }
+  }
+  useEffect(() => {
+    alive.current = true;
+    void refresh();
+    return () => { alive.current = false; request.current++; };
+  }, []);
+  useEffect(() => { setCallbackUrl(""); }, [pending?.loginId]);
+  useEffect(() => {
+    if ((!pending && account?.login?.status !== "pending") || busy) return;
+    const timer = window.setInterval(() => void refresh(), 2000);
+    return () => window.clearInterval(timer);
+  }, [pending, account?.login?.status, busy]);
+
+  async function authenticate(type: "apiKey" | "chatgpt") {
+    if (!account || busy) return;
+    if (type === "apiKey" && !apiKey.trim()) {
+      setError("Enter an API key.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setCallbackUrl("");
+    try {
+      const result = await api<{
+        type: string;
+        loginId?: string;
+        authUrl?: string;
+        redirectUri?: string;
+      }>("/codex/login", "POST", {
+        type,
+        version: account.version,
+        ...(type === "apiKey" ? { apiKey } : {
+          newAccount: registrationId === "new",
+          ...(registrationId && registrationId !== "new" ? { registrationId } : {}),
+        }),
+      });
+      if (!alive.current) return;
+      setApiKey("");
+      if (result.loginId)
+        setPending({ loginId: result.loginId, url: result.authUrl, redirectUri: result.redirectUri });
+      await refresh();
+      changed.current();
+    } catch (error) {
+      if (alive.current) {
+        setError(signInError(error));
+        if (error instanceof ApiError && error.status === 409) void refresh();
+      }
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  }
+  async function completeSignIn() {
+    if (!account || !pending || busy || !callbackUrl.trim()) return;
+    const address = callbackUrl.trim();
+    setCallbackUrl("");
+    setBusy(true);
+    setError("");
+    try {
+      await api("/codex/login/callback", "POST", {
+        loginId: pending.loginId,
+        callbackUrl: address,
+        version: account.version,
+      });
+      if (!alive.current) return;
+      await refresh();
+      changed.current();
+    } catch (error) {
+      if (alive.current) {
+        setError(error instanceof ApiError && error.status === 409
+          ? "Sign in changed in another browser. Refresh the status before continuing."
+          : "Sign in could not be completed. Check the complete address from your browser, or cancel and start again.");
+        void refresh();
+      }
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  }
+  async function endAuthentication(cancel: boolean) {
+    if (!account || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setCallbackUrl("");
+    try {
+      const result = await api<{ warning?: string; revocationConfirmed?: boolean }>(cancel ? "/codex/login/cancel" : "/codex/account", cancel ? "POST" : "DELETE", {
+        version: account.version,
+        ...(pending ? { loginId: pending.loginId } : {}),
+      });
+      if (!alive.current) return;
+      setPending(null);
+      setRegistrationId("");
+      setPlanNotice(false);
+      if (!cancel && result.revocationConfirmed === false)
+        setNotice(result.warning || "Signed out locally. Review this app’s access in ChatGPT settings because revocation could not be confirmed.");
+      await refresh();
+      changed.current();
+    } catch (error) {
+      if (alive.current) {
+        setError(signInError(error));
+        if (error instanceof ApiError && error.status === 409) void refresh();
+      }
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  }
+  let loginUrl: string | undefined;
+  try {
+    const url = new URL(pending?.url || "");
+    if (url.protocol === "https:" && url.hostname === "auth.openai.com" && !url.username && !url.password) loginUrl = url.href;
+  } catch {}
+  const waiting = !!pending || account?.login?.status === "pending";
+  const locked = busy || disabled || !account;
+  return (
+    <section className="panel">
+      <h2>Codex Authentication</h2>
+      <p role="status">
+        {account ? account.authenticated
+          ? `Connected${account.account?.email ? ` as ${account.account.email}` : account.account?.type === "apiKey" ? " with an API key" : " with ChatGPT"}${account.account?.planType ? ` (${account.account.planType})` : ""}.`
+          : "Not signed in." : error ? "Codex is unavailable." : "Checking Codex authentication…"}
+      </p>
+      {account?.authenticated && account.auth_method === "siwc" && <p className="hint">Using your ChatGPT plan. <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage</a>.</p>}
+      {account?.auth_method === "legacy" && <p className="hint">Reconnect ChatGPT below to use the updated sign-in.</p>}
+      <div className="provider-actions">
+        <button type="button" className="secondary small" disabled={busy || disabled} onClick={() => { setError(""); void refresh(); }}>Refresh Status</button>
+        {account?.authenticated && <button type="button" className="text-button" disabled={locked} onClick={() => void endAuthentication(false)}>Sign Out</button>}
+      </div>
+      {waiting ? (
+        <div className="oauth-flow">
+          <p role="status">Complete sign in and approve access to your ChatGPT plan in the browser. This page updates automatically.</p>
+          {loginUrl && <a className="button" href={loginUrl} target="_blank" rel="noreferrer">Open ChatGPT Sign In</a>}
+          <p className="hint">If the final browser page cannot open, copy its full address and paste it below. This also works when your browser is on another computer.</p>
+          <label>
+            Final Browser URL
+            <input type="text" autoComplete="off" autoCapitalize="off" spellCheck={false}
+              value={callbackUrl} disabled={locked || !pending}
+              placeholder={pending?.redirectUri || "Paste the complete final browser address"}
+              onChange={(event) => setCallbackUrl(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void completeSignIn(); } }} />
+          </label>
+          <div className="provider-actions">
+            <button type="button" className="secondary small" disabled={locked || !pending || !callbackUrl.trim()} onClick={() => void completeSignIn()}>Complete Sign In</button>
+            <button type="button" className="text-button" disabled={locked} onClick={() => void endAuthentication(true)}>Cancel Sign In</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {!!account?.registrations?.length && <>
+            <label htmlFor="codex-chatgpt-account">ChatGPT Account</label>
+            <select id="codex-chatgpt-account" value={registrationId} disabled={locked} onChange={(event) => setRegistrationId(event.target.value)}>
+              {account.registrations.map((item) => <option key={item.id} value={item.id}>
+                {item.email || "Saved ChatGPT account"}{account.registrations!.filter((other) => other.email === item.email).length > 1 ? ` (${(item.clientId || item.id).slice(-8)})` : ""}{account.authenticated && account.auth_method === "siwc" && (item.selected || item.active) ? " (connected)" : ""}
+              </option>)}
+              <option value="new">Another ChatGPT account or workspace</option>
+            </select>
+          </>}
+          <div className="provider-actions">
+            <button type="button" className="secondary small" data-oai-siwc-button="" disabled={locked} onClick={() => void authenticate("chatgpt")}>Continue with ChatGPT</button>
+          </div>
+          <p className="hint">Authorize requests using your ChatGPT plan. This connection does not grant access to your ChatGPT conversations.</p>
+          <label className="codex-key">
+            API Key
+            <input type="password" autoComplete="off" value={apiKey} disabled={locked}
+              onChange={(event) => setApiKey(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void authenticate("apiKey"); } }}
+              placeholder="Enter an OpenAI API key" />
+          </label>
+          <div className="provider-actions">
+            <button type="button" className="secondary small" disabled={locked || !apiKey.trim()} onClick={() => void authenticate("apiKey")}>Save API Key</button>
+          </div>
+        </>
+      )}
+      {planNotice && account?.authenticated && account.auth_method === "siwc" && <div className="oauth-flow">
+        <p>You’re using your ChatGPT plan.</p>
+        <p className="hint">You can review and manage this app’s usage in <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">ChatGPT usage settings</a>.</p>
+        <button type="button" className="secondary small" onClick={() => {
+          localStorage.setItem("family-agents.chatgpt-plan-notice", "dismissed");
+          setPlanNotice(false);
+        }}>Got it</button>
+      </div>}
+      {notice && <p className="hint" role="status">{notice}</p>}
+      {error && <Alert>{error}</Alert>}
+    </section>
+  );
+}
+
 function SettingsPage({ onBack }: { onBack: () => void }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [models, setModels] = useState<Model[]>([]);
@@ -1101,34 +1356,71 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
   const [providers, setProviders] = useState(false);
   const [busy, setBusy] = useState(false);
   const [selecting, setSelecting] = useState(false);
+  const [changingRuntime, setChangingRuntime] = useState(false);
   const selection = useRef(0);
+  const runtimeRequest = useRef(0);
+  const modelRequest = useRef(0);
+  const currentRuntime = useRef<Settings["runtime"]>("pi");
+  const drafts = useRef<Partial<Record<Settings["runtime"], RuntimeDefaults>>>({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [conflict, setConflict] = useState(false);
-  async function loadModels() {
+  async function loadModels(runtime = currentRuntime.current) {
+    if (runtime !== currentRuntime.current) return;
+    const request = ++modelRequest.current;
     setLoadingModels(true);
     try {
-      const catalog = await api<Model[]>("/models");
-      setModels(catalog.filter((model) => model.available));
+      const catalog = await api<Model[]>(`/models?runtime=${runtime}`);
+      if (request === modelRequest.current && runtime === currentRuntime.current)
+        setModels(catalog.filter((model) => model.available));
     } catch (error) {
-      setError(errorText(error));
+      if (request === modelRequest.current) setError(errorText(error));
     } finally {
-      setLoadingModels(false);
+      if (request === modelRequest.current) setLoadingModels(false);
     }
   }
   async function loadSettings() {
     try {
-      setSettings(await api<Settings>("/settings"));
+      const next = await api<Settings>("/settings");
+      currentRuntime.current = next.runtime;
+      drafts.current = {};
+      selection.current++;
+      runtimeRequest.current++;
+      setSettings(next);
       setConflict(false);
       setError("");
+      await loadModels(next.runtime);
     } catch (error) {
       setError(errorText(error));
     }
   }
   useEffect(() => {
     void loadSettings();
-    void loadModels();
+    return () => { modelRequest.current++; runtimeRequest.current++; selection.current++; };
   }, []);
+  async function chooseRuntime(runtime: Settings["runtime"]) {
+    if (!settings || runtime === settings.runtime) return;
+    drafts.current[settings.runtime] = { provider: settings.provider, model: settings.model, thinking_level: settings.thinking_level };
+    const request = ++runtimeRequest.current;
+    selection.current++;
+    modelRequest.current++;
+    setSelecting(false);
+    setChangingRuntime(true);
+    setError("");
+    setNotice("");
+    try {
+      const defaults = drafts.current[runtime] ?? await api<RuntimeDefaults>(`/runtime-defaults?runtime=${runtime}`);
+      if (request !== runtimeRequest.current) return;
+      currentRuntime.current = runtime;
+      setModels([]);
+      setSettings((current) => current ? { ...current, ...defaults, runtime } : current);
+      await loadModels(runtime);
+    } catch (error) {
+      if (request === runtimeRequest.current) setError(errorText(error));
+    } finally {
+      if (request === runtimeRequest.current) setChangingRuntime(false);
+    }
+  }
   async function chooseModel(value: string) {
     if (!settings) return;
     const [provider, model] = JSON.parse(value) as [string, string];
@@ -1162,7 +1454,9 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
     setError("");
     setNotice("");
     try {
-      setSettings(await api<Settings>("/settings", "PUT", settings));
+      const saved = await api<Settings>("/settings", "PUT", settings);
+      setSettings(saved);
+      drafts.current[saved.runtime] = { provider: saved.provider, model: saved.model, thinking_level: saved.thinking_level };
       setNotice(
         "Settings saved. Agents use these defaults from their next turn.",
       );
@@ -1179,9 +1473,9 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
       <Providers
         onBack={() => {
           setProviders(false);
-          void loadModels();
+          void loadModels("pi");
         }}
-        onChanged={() => void loadModels()}
+        onChanged={() => void loadModels("pi")}
       />
     );
   const selected = models.find(
@@ -1219,16 +1513,24 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
             />
           </section>
           <section className="panel">
-            <h2>Providers</h2>
-            <button
-              type="button"
-              className="navigation-row"
-              onClick={() => setProviders(true)}
-            >
-              Configure Providers
-              <Arrow />
-            </button>
+            <h2>Agent Runtime</h2>
+            <label className="sr-only" htmlFor="agent-runtime">Agent Runtime</label>
+            <select id="agent-runtime" value={settings.runtime} disabled={busy || changingRuntime}
+              onChange={(event) => void chooseRuntime(event.target.value as Settings["runtime"])}>
+              <option value="pi">Pi Coding Agent</option>
+              <option value="codex">Codex App Server</option>
+            </select>
+            <p className="hint">All Agents use this runtime. Save Settings to apply the selection.</p>
           </section>
+          {settings.runtime === "pi" ? (
+            <section className="panel">
+              <h2>Providers</h2>
+              <button type="button" className="navigation-row" disabled={busy || changingRuntime} onClick={() => setProviders(true)}>
+                Configure Providers
+                <Arrow />
+              </button>
+            </section>
+          ) : <CodexAuthentication onChanged={() => void loadModels("codex")} disabled={busy || changingRuntime} />}
           <section className="panel">
             <h2>Default Model</h2>
             <label className="sr-only" htmlFor="default-model">
@@ -1238,7 +1540,7 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
               id="default-model"
               required
               value={selected ? modelKey(selected) : ""}
-              disabled={busy || loadingModels || !models.length}
+              disabled={busy || changingRuntime || loadingModels || !models.length}
               onChange={(event) => void chooseModel(event.target.value)}
             >
               <option value="" disabled>
@@ -1246,7 +1548,7 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
                   ? "Loading models…"
                   : models.length
                     ? "Select a model"
-                    : "Configure a provider first"}
+                    : settings.runtime === "codex" ? "Sign in to Codex first" : "Configure a provider first"}
               </option>
               {models.map((model) => (
                 <option key={modelKey(model)} value={modelKey(model)}>
@@ -1256,15 +1558,15 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
             </select>
             {!loadingModels && !models.length && (
               <p className="hint" role="status">
-                No models are available yet. Configure a provider above to get
-                started.
+                {settings.runtime === "codex"
+                  ? "No models are available yet. Check Codex authentication above and refresh the status."
+                  : "No models are available yet. Configure a provider above to get started."}
               </p>
             )}
             {!loadingModels && settings.model && !selected && (
               <p className="hint" role="status">
                 Saved model {settings.provider} / {settings.model} is
-                unavailable. Configure its provider or choose another available
-                model.
+                unavailable. {settings.runtime === "codex" ? "Check Codex authentication or choose another available model." : "Configure its provider or choose another available model."}
               </p>
             )}
           </section>
@@ -1273,7 +1575,7 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
             <label>
               Thinking Level
               <select
-                disabled={!selected || selecting || busy}
+                disabled={!selected || selecting || busy || changingRuntime}
                 value={
                   levels.includes(settings.thinking_level)
                     ? settings.thinking_level
@@ -1324,7 +1626,7 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
             </p>
           )}
           <div className="actions">
-            <button disabled={busy || selecting || loadingModels || !selected}>
+            <button disabled={busy || selecting || changingRuntime || loadingModels || !selected}>
               {busy ? "Saving…" : "Save Settings"}
             </button>
           </div>

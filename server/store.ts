@@ -56,6 +56,7 @@ export interface Settings {
   provider: string;
   model: string;
   thinking_level: string;
+  runtime: "pi" | "codex";
 }
 export type Image = { data: string; mime_type: string };
 export function image(value: unknown): Image | null {
@@ -96,11 +97,18 @@ export class Store {
       CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY,person_id TEXT NOT NULL REFERENCES people(id),matrix_id TEXT UNIQUE NOT NULL,display_name TEXT NOT NULL,avatar TEXT,instructions TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'Stopped',error TEXT,version INTEGER NOT NULL DEFAULT 1,desired INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS credentials(agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,secret BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,homeserver TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,thinking_level TEXT NOT NULL);
-      INSERT OR IGNORE INTO settings VALUES(1,1,'','','','off');
+      INSERT OR IGNORE INTO settings(id,version,homeserver,provider,model,thinking_level) VALUES(1,1,'','','','off');
       CREATE TABLE IF NOT EXISTS inbox(agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,event_id TEXT NOT NULL,room_id TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',created INTEGER NOT NULL,PRIMARY KEY(agent_id,event_id));
       CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,room_id TEXT NOT NULL,payload TEXT NOT NULL,sent INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);
       UPDATE agents SET status='Stopped',error=NULL;
       UPDATE inbox SET state='interrupted' WHERE state='running';`);
+    // Additive upgrade preserves existing Pi defaults and all business records.
+    const columns = this.db.prepare("PRAGMA table_info(settings)").all();
+    if (!columns.some((column) => column.name === "runtime"))
+      this.db.exec("ALTER TABLE settings ADD COLUMN runtime TEXT NOT NULL DEFAULT 'pi'");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS runtime_defaults(
+      runtime TEXT PRIMARY KEY,provider TEXT NOT NULL,model TEXT NOT NULL,thinking_level TEXT NOT NULL);
+      INSERT OR IGNORE INTO runtime_defaults SELECT runtime,provider,model,thinking_level FROM settings WHERE id=1;`);
   }
   transaction<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -196,17 +204,26 @@ export class Store {
     return s as unknown as Settings;
   }
   saveSettings(s: Settings) {
-    const r = this.db
-      .prepare(
-        "UPDATE settings SET version=version+1,homeserver=?,provider=?,model=?,thinking_level=? WHERE id=1 AND version=?",
-      )
-      .run(s.homeserver, s.provider, s.model, s.thinking_level, s.version);
-    if (!r.changes)
-      throw new AppError(
-        409,
-        "Settings changed in another browser. Reload before saving.",
-      );
-    return this.settings();
+    return this.transaction(() => {
+      const r = this.db
+        .prepare(
+          "UPDATE settings SET version=version+1,homeserver=?,provider=?,model=?,thinking_level=?,runtime=? WHERE id=1 AND version=?",
+        )
+        .run(s.homeserver, s.provider, s.model, s.thinking_level, s.runtime ?? "pi", s.version);
+      if (!r.changes)
+        throw new AppError(
+          409,
+          "Settings changed in another browser. Reload before saving.",
+        );
+      this.db.prepare(`INSERT INTO runtime_defaults VALUES(?,?,?,?) ON CONFLICT(runtime)
+        DO UPDATE SET provider=excluded.provider,model=excluded.model,thinking_level=excluded.thinking_level`)
+        .run(s.runtime ?? "pi", s.provider, s.model, s.thinking_level);
+      return this.settings();
+    });
+  }
+  runtimeDefaults(runtime: "pi" | "codex") {
+    return this.db.prepare("SELECT provider,model,thinking_level FROM runtime_defaults WHERE runtime=?").get(runtime)
+      ?? { provider: runtime === "codex" ? "codex" : "", model: "", thinking_level: "" };
   }
   enqueue(id: string, event: string, room: string, payload: unknown) {
     return !!this.db

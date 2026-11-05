@@ -79,3 +79,48 @@ Live desktop/mobile checks confirmed that the editor and save controls are hidde
 The Default Model dropdown filters Pi's native catalog by actual SDK availability instead of displaying unconfigured providers. The complete registry remains available to backend configuration code. An unavailable saved choice is preserved with a clear message, and an empty list points to provider setup and disables invalid saves. Provider changes reload the available list. During this check, the native catalog contained 1,592 models, while the two connected providers supplied 46 available models.
 
 Live desktop/mobile browser checks matched the dropdown options exactly to SDK-available models, preserved the saved default, exercised the empty/unavailable state, reloaded after provider changes, included an available custom model, and verified native thinking levels. No settings were saved or changed during these checks.
+
+## Thin Agent Runtime implementation (5 November 2026)
+
+Implemented a shared application-facing interface, an embedded Pi adapter, and a supervised Codex App Server adapter. Existing databases upgrade additively to Pi by default, retain all People/Agents/passwords, and preserve independent runtime defaults. Pi's native providers, tools, sessions, thinking levels, and compaction remain intact. Runtime switching drains or cancels active execution, keeps verified incoming events durable, restores target sessions, and rolls back failed preparation without restarting Matrix clients. Combined homeserver/runtime changes isolate old-server work before queue resumption; Gateway restoration waits for runtime transitions.
+
+Validation for this change:
+
+- Frontend/backend TypeScript checks and all 45 Node tests passed. Tests include real Pi SDK fixture execution, JSONL framing/request correlation, safe approvals, process crashes/reconnection without replay, bounded shutdown, thread persistence/isolation, image input/output, dynamic reasoning metadata, optimistic authentication updates, device-code login notifications, early streaming/tool events, cancellation, runtime switching, rollback, inbox deduplication, and legacy database upgrades.
+- All 14 Rust Gateway tests, Clippy with warnings denied, and Rust formatting checks passed. Gateway source and protocol were unchanged.
+- The production build, including the corresponding-source archive, passed in a separate temporary source/build directory. The running deployment's executables and service were not replaced or restarted.
+- Headless Chromium checks with mocked APIs passed runtime draft/save behavior, per-runtime defaults, Pi provider visibility, API-key login/logout, browser/device-code sign in and cancellation/polling, and dynamic thinking options with no browser errors.
+- Installed `codex-cli 0.166.0` passed isolated native initialization, `account/read`, `model/list` (nine discovered catalog models), `config/read`, and `thread/start` with the fixed dynamic image tool. The actual CLI accepted read-only sandbox/network restrictions and live web-search configuration. It requires `on-request` approval policy even though generated types also list `untrusted`; unsupported requests are declined by the client.
+- Real native startup confirmed that empty threads have no persistent rollout until their first turn. New Agent threads are therefore deferred until first input. Atomic mappings distinguish never-submitted threads from submitted conversations; submitted history is always resumed and never silently replaced.
+
+No existing desktop Codex credentials were read or reused. Real provider login, billed Codex inference, image understanding, live web search, and encrypted Matrix delivery through Codex have not been performed with live credentials for this change. Account/model entitlement and compaction behavior remain native to the runtime. Direct source links are preserved; opaque native citation markers are not resolved, so Agent instructions request ordinary Markdown source links.
+
+## Runtime deployment (5 November 2026)
+
+Deployed the validated runtime build to the existing `webtop-desktop` service after the user requested deployment and restart. Installed the matching standalone `codex-cli 0.166.0` in persistent `/config/.local/opt/codex-0.166.0/bin/codex`, linked from `/config/.local/bin/codex`. No existing Codex account credentials were copied. The launcher and unrelated services, including Tuwunel, were unchanged.
+
+Stopped only `/run/service/family-agents`, backed up the stopped data directory and previous production build privately, replaced `dist`, and restarted through s6. Both Node and the Matrix Gateway run as UID 1000. The loopback and existing tailnet HTTPS `/api/health` endpoints report ready, Pi remains selected, and the original Agent is Running without an error. Existing Matrix session and signing-secret files are byte-identical across the restart.
+
+The production frontend serves the new runtime selector and device-code sign-in controls. The actual service successfully launched its isolated Codex App Server: `account/read` reports unauthenticated and `model/list` discovers nine models with native reasoning metadata. No login or inference was initiated; the user will test Codex authentication and encrypted conversations from the existing control panel and Matrix client.
+
+## Sign in with ChatGPT migration (5 November 2026)
+
+Replaced the Codex adapter's legacy managed ChatGPT login with the current open-source Sign in with ChatGPT flow, while retaining native API-key login. Installed Pi 1.5.0 is also the current npm release and already supports the new OpenAI flow and a pasted full callback URL; the Codex adapter now follows the official registration and verified-identity contract using an independent credential store. Pi's providers and credentials were not changed.
+
+`ChatGptAuth` persists a stable host ID and separate verified account/client registrations, supports loopback and pasted callback completion, reuses issued client IDs, verifies state/PKCE/JWT signature/issuer/audience/expiry/nonce and plan-use scopes, and serializes rotating refresh tokens with private atomic writes. Sign-out attempts renewable-session revocation and clears tokens while retaining registration metadata. Failed or cancelled attempts preserve a working connection. Existing legacy credentials do not authorize inference through the new flow.
+
+The Codex child receives the access token only in its isolated environment and uses the documented Responses provider at `https://api.openai.com/v1`. Token replacement waits for live execution leases to finish before restarting the shared process and resuming persistent threads. Internal cancellation continues to work while a token replacement is queued. Authentication completion restores desired Agents without replacing existing Matrix clients.
+
+Validation:
+
+- All 68 Node tests and frontend/backend TypeScript checks passed, including 15 SIWC tests with locally signed JWTs and mocked OpenAI endpoints. Coverage includes full callback exchange, real loopback callback delivery, malformed requests, signature/nonce/identity/scope rejection, immediate cancellation during listener startup, cancellation during exchange/commit, expired grants, saved/new registrations, client-ID reuse after a failed code exchange, serialized refresh rotation, revoked refresh grants, and unconfirmed remote revocation.
+- Runtime/client tests verify token isolation from process arguments, old-login rejection, two concurrent Agents during token replacement, cancellation and shutdown without process resurrection, callback-driven Agent recovery, and API-key success after a failed SIWC attempt.
+- All 14 unchanged Rust Gateway tests passed.
+- Headless Chromium with mocked APIs passed new authorization-link, pasted-URL, pending-flow reload, automatic completion, cancellation, invalid/stale callback, saved-account/new-account, plan-use notice, and retained API-key flows with no browser errors.
+- The actual installed Codex 0.166.0 accepted the custom Responses provider, environment-only dummy token, native model discovery, explicit per-thread provider selection, dynamic image tool, read-only permissions, and live-search configuration in an isolated smoke test. No real SIWC login or model inference was performed; the user will test those after deployment.
+
+Deployed this migration to the existing s6-managed service after backing up the stopped data and previous build. The loopback and existing tailnet HTTPS health endpoints report ready; Node and Gateway still run as UID 1000. The selected runtime, saved defaults, native thread history, and original Matrix session/signing files were retained. The earlier native ChatGPT connection is explicitly reported as legacy and requires new authorization; the Agent shows an authentication error until that authorization succeeds, then the authentication callback restores it automatically.
+
+Live production smoke checks verified the new authorize endpoint, dynamic client registration, direct-plan scopes/resource, PKCE/nonce, stable host ID, manual callback prompt, and rejection/redaction of a synthetic invalid callback. The synthetic attempt was cancelled without exchanging or replacing credentials. The production frontend serves Continue with ChatGPT and Final Browser URL controls; legacy device-code controls are removed. API-key login is retained. Real sign-in and conversation testing are left to the user as requested.
+
+The user subsequently completed the new Sign in with ChatGPT authorization and reported successful testing. Read-only production checks confirmed `auth_method: siwc`, `authenticated: true`, and the original Agent Running without an error.

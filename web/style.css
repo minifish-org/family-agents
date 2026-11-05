@@ -653,6 +653,9 @@ dialog::backdrop {
 .provider-actions .text-button {
   padding: 8px;
 }
+.codex-key {
+  margin-top: 18px;
+}
 .oauth-flow {
   margin-top: 15px;
   background: #f6f9ff;

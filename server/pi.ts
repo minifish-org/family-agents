@@ -709,6 +709,17 @@ export class PiService {
     this.sessions.set(agent.id, await this.createSession(agent, defaults));
   }
 
+  async validate(defaults: PiDefaults): Promise<void> {
+    await this.ready;
+    this.resolveModel(defaults.provider, defaults.model);
+    if (!(await this.runtime.checkAuth(defaults.provider)))
+      throw new PiError("Configure authentication for the selected global model provider in Settings.");
+  }
+
+  async deactivate(): Promise<void> {
+    await Promise.allSettled([...this.sessions.keys()].map((id) => this.stopAgent(id)));
+  }
+
   /** Each agent is serial, while unrelated agents have independent promise chains. */
   run(
     agent: PiAgent,

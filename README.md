@@ -7,6 +7,7 @@ Family Agents gives each family member their own AI assistants, each with a dedi
 - **Personal assistants:** each Agent belongs to one Person and responds only to that owner's verified direct messages.
 - **Familiar chat:** conversations happen in Matrix; the web panel manages People, Agents, and shared settings.
 - **Your choice of model:** configure providers through the Pi SDK, including API keys and supported account sign-in flows.
+- **Two runtimes:** select Pi Coding Agent or Codex App Server globally in Settings, with independent saved defaults and conversation state.
 - **Persistent conversations:** each Agent keeps its own conversation across restarts, with automatic context compaction.
 - **Text and images:** use an image-capable model for image input; the fixed image tool can return an image attached to the current message.
 
@@ -33,7 +34,7 @@ Private web control panel
 
 Only encrypted, invite-only, one-to-one direct messages between an Agent and its owner are accepted. Group chats, outsiders, and self messages do not trigger replies. Existing eligible direct conversations are discovered automatically.
 
-Matrix encryption protects messages in transit between clients. The Agent decrypts accepted messages and sends their content to the configured model provider for a response. Agents have no shell, filesystem, MCP, or arbitrary network tools.
+Matrix encryption protects messages in transit between clients. The Agent decrypts accepted messages and sends their content to the configured runtime's model provider for a response. Pi has no shell, filesystem, MCP, or arbitrary network tools. Codex disables execution and extension discovery, uses a read-only sandbox, and retains native live web search when supported by the model and account.
 
 ## Requirements
 
@@ -124,6 +125,7 @@ Set environment variables in the shell or service manager that starts the applic
 | `PORT` | `18090` | Control panel port. |
 | `DATA_DIR` | `data/` | Private data directory, resolved from the working directory. |
 | `GATEWAY_BIN` | `gateway/target/release/family-matrix-gateway` | Path to the Rust Gateway executable, relative to the working directory unless absolute. |
+| `CODEX_BIN` | `codex` | Optional Codex CLI executable for Codex App Server; install on the same host as the service. |
 | `PUBLIC_ORIGIN` | Unset | Exact allowed browser origin, such as `https://agents.example.org`, when a reverse proxy changes the request host. This does not add authentication. |
 
 For example, to use a different port and an absolute data directory:
@@ -138,6 +140,22 @@ For continuous operation, use your service manager to run `npm start` from the r
 
 Changing the Matrix Server setting reinitializes Agent connections, archives previous Matrix stores, and isolates pending work from the old server. Reenter credentials if the new server requires them.
 
+### Agent Runtime
+
+Existing installations continue using **Pi Coding Agent**. Its complete native provider configuration remains available under **Configure Providers**. Select **Codex App Server** in Settings to view its authentication and model configuration, then save to activate it for every Agent. Runtime selection and model fields are global; the Agent form stays unchanged.
+
+Codex requires the official CLI (protocol types currently generated with `codex-cli 0.166.0`). Choose **Continue with ChatGPT** for the current open-source Sign in with ChatGPT flow, or configure an API key through Codex's native account API. ChatGPT plan authorization and credentials are kept separately under `DATA_DIR/codex/siwc`; neither option reuses desktop credentials or Pi's credential store. Model discovery lists the runtime's catalog and reasoning efforts; catalog presence alone does not guarantee account access to a model.
+
+For ChatGPT sign-in, open the authorization link and approve access to your ChatGPT plan. If your browser is on another machine, its final `http://127.0.0.1:.../auth/callback` page may not load. Copy the entire address from the browser and paste it into **Final Browser URL**, then choose **Complete Sign In**. Keep the code and URL private. The app checks the authorization state, PKCE exchange, ID-token signature/identity/nonce, and granted plan-use scopes before replacing a working connection. Saved account registrations retain their own client IDs for future sign-in. A legacy Codex ChatGPT login needs a new authorization; it is not silently reused. API-key login remains available.
+
+Eligible ChatGPT requests are sent through the documented Responses provider using a token in the child process environment. Tokens refresh before expiry; new turns wait while existing turns finish, then the App Server restarts with the refreshed token and resumes persistent threads. Sign-out clears local tokens and attempts remote session revocation. Review usage and app access in [ChatGPT usage settings](https://chatgpt.com/settings/usage). Follow current OpenAI account and application eligibility requirements.
+
+Switching validates installation, authentication, and model selection first. New Matrix messages remain in the durable inbox while active replies finish; turns exceeding the transition wait are safely cancelled without automatic replay. The target's per-Agent sessions are prepared before committing the selection. Failures retain or restore the previous runtime. Runtime switching preserves Matrix connections and E2EE stores. Switching back resumes each runtime's own conversation; histories are not converted or merged.
+
+Codex uses one shared App Server process with independent persistent threads and developer instructions per Agent. It accepts text and images and returns final assistant text, source links, and attached images through the existing Matrix delivery path. Internal reasoning and tool diagnostics are not sent to Matrix. Unsupported approvals are declined and the limitation is reported. Native web search uses live mode, subject to runtime/model/account support; there is no additional search service. See the [official App Server protocol](https://learn.chatgpt.com/docs/app-server).
+
+Source links in assistant text are preserved. Codex is instructed to provide ordinary Markdown links because Matrix cannot resolve opaque native citation markers; this adapter does not add a separate marker-resolution service.
+
 ## Data and backups
 
 By default, private data lives in `data/`, which is excluded from Git. The application creates private directories with mode `0700` and private files with mode `0600`.
@@ -148,6 +166,9 @@ By default, private data lives in `data/`, which is excluded from Git. The appli
 | `credentials.key` | Key needed to decrypt stored Matrix passwords. |
 | `pi/models.json`, `pi/auth.json` | Pi provider configuration and authentication. |
 | `agents/<id>/sessions/` | Each Agent's persistent conversation. |
+| `codex/home/` | Codex-native credentials and persistent conversation state. |
+| `codex/siwc/` | Sign in with ChatGPT registrations, stable host ID, and private renewable credentials. |
+| `codex/agents/<id>/` | Private per-Agent working directories and atomic Codex thread mappings. |
 | `matrix/<id>/` | Matrix device session, encryption keys, sync state, and pending events. |
 | `matrix-archives/` | Matrix stores archived after identity/server changes or recovery. |
 
@@ -181,7 +202,7 @@ The endpoint returns core readiness and individual Agent statuses. A ready Gatew
 
 The application has two components:
 
-- **Node.js/TypeScript:** Hono API, React UI, SQLite metadata, the official Pi SDK, and supervision of the Gateway.
+- **Node.js/TypeScript:** Hono API, React UI, SQLite metadata, the thin Agent Runtime boundary, embedded Pi SDK, and supervision of Codex App Server and the Gateway.
 - **Rust Gateway:** the official `matrix-rust-sdk` handles Agent authentication, sync, encryption, profiles, and media. Communication with Node uses versioned JSONL; see [`gateway/PROTOCOL.md`](gateway/PROTOCOL.md).
 
 To work on the application after `npm ci` and `npm run gateway:build`, start the backend in one terminal:
@@ -210,6 +231,8 @@ cargo fmt --check --manifest-path gateway/Cargo.toml
 ```
 
 Tests cover storage, credential handling, owner-only routing, lifecycle operations, persistent Pi sessions, and Gateway policies. Read [`AGENTS.md`](AGENTS.md) before changing architecture or routing, and [`VALIDATION.md`](VALIDATION.md) for deployment acceptance results and remaining limitations.
+
+Regenerate version-matched Codex protocol types with `npm run codex:generate` after installing the target CLI version. Integration tests exercise a fake stdio server without model credentials. Native startup, authentication, live model inference, image understanding, and live search depend on the service host's CLI, credentials, and model access; do not claim those live checks passed without running them.
 
 The optional live driver, `scripts/live-e2e.mjs`, needs dedicated test accounts and private external credentials. It changes settings, restarts the application, and deliberately corrupts a temporary test Agent's crypto store. Follow `VALIDATION.md`; it is not part of ordinary installation or automated tests.
 

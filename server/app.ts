@@ -3,6 +3,7 @@ import { bodyLimit } from "hono/body-limit";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { AppError, matrixId, required, type Settings } from "./store.js";
 import { Manager } from "./manager.js";
+import { runtimeId } from "./runtime-manager.js";
 
 export function homeserver(value: unknown) {
   const raw = required(value, "Matrix Server", 2048);
@@ -109,6 +110,8 @@ export function createApp(m: Manager) {
       {
         status: m.gateway.ready && !m.closing ? "ready" : "unavailable",
         gateway: m.gateway.ready,
+        runtime: m.runtimes.selected,
+        switching_runtime: m.transitioning,
         agents: m.store
           .agents()
           .map((a) => ({ id: a.id, status: a.status, error: a.error })),
@@ -170,7 +173,7 @@ export function createApp(m: Manager) {
   app.get("/api/settings", (c) => c.json(m.store.settings()));
   app.put("/api/settings", async (c) => {
     const b = (await c.req.json()) as Settings;
-    return m.serial.run("global-settings", async () => {
+    return m.settingsSerial.run("global-settings", async () => {
       const old = m.store.settings();
       if (old.version !== b.version)
         throw new AppError(
@@ -181,28 +184,57 @@ export function createApp(m: Manager) {
       if (server !== old.homeserver) await probe(server);
       const provider = required(b.provider, "Default Model provider", 255),
         model = required(b.model, "Default Model", 255);
-      m.pi.resolveModel(provider, model);
-      const thinking = m.pi.clampThinking(provider, model, b.thinking_level);
-      const result = m.store.saveSettings({
+      const result = await m.configure({
         ...b,
         homeserver: server,
         provider,
         model,
-        thinking_level: thinking,
+        runtime: runtimeId(b.runtime ?? old.runtime),
       });
-      if (server !== old.homeserver) await m.reconnectAll();
       return c.json(result);
     });
   });
-  app.get("/api/models", async (c) => c.json(await m.pi.models()));
+  app.get("/api/runtime-defaults", (c) =>
+    c.json(m.store.runtimeDefaults(runtimeId(c.req.query("runtime") ?? m.runtimes.selected))),
+  );
+  app.get("/api/models", async (c) => c.json(await m.runtimes.get(c.req.query("runtime") ?? m.runtimes.selected).models()));
   app.post("/api/model-selection", async (c) => {
     const b = await c.req.json();
     const provider = required(b.provider, "Provider", 255),
       model = required(b.model, "Model", 255);
-    return c.json({
-      thinking_level: m.pi.clampThinking(provider, model, b.thinking_level),
-      thinking_levels: m.pi.thinkingLevels(provider, model),
+    return c.json(await m.runtimes.get(b.runtime ?? m.runtimes.selected).selection({
+      provider, model, thinking_level: typeof b.thinking_level === "string" ? b.thinking_level : "",
+    }));
+  });
+  app.get("/api/codex/account", async (c) => c.json(await m.codex.account()));
+  app.post("/api/codex/login", async (c) => {
+    const body = await c.req.json();
+    if (body.type !== "apiKey" && body.type !== "chatgpt")
+      throw new AppError(400, "Choose an API key or Sign In with ChatGPT.");
+    return c.json(await m.codex.login({
+      type: body.type, version: body.version,
+      ...(body.type === "chatgpt" ? {
+        newAccount: body.newAccount === true,
+        ...(body.registrationId === undefined ? {} : { registrationId: required(body.registrationId, "ChatGPT account", 256) }),
+      } : {}),
+      ...(body.type === "apiKey" ? { apiKey: required(body.apiKey, "API key", 16384) } : {}),
+    }));
+  });
+  app.post("/api/codex/login/callback", async (c) => {
+    const body = await c.req.json();
+    await m.codex.submitLogin({
+      version: body.version,
+      loginId: required(body.loginId, "Sign-in request", 256),
+      callbackUrl: required(body.callbackUrl, "Full callback URL", 32768),
     });
+    return c.json({ ok: true });
+  });
+  app.delete("/api/codex/account", async (c) => {
+    return c.json(await m.codex.logout((await c.req.json()).version));
+  });
+  app.post("/api/codex/login/cancel", async (c) => {
+    await m.codex.cancelLogin((await c.req.json()).version);
+    return c.json({ ok: true });
   });
   app.get("/api/providers", async (c) => c.json(await m.pi.providers()));
   app.get("/api/providers/config", (c) => c.json(m.pi.config()));

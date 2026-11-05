@@ -12,20 +12,41 @@ import {
   password,
   type Agent,
   type Image,
+  type Settings,
 } from "./store.js";
 import { PiService } from "./pi.js";
+import { PiRuntime } from "./pi-runtime.js";
+import { CodexRuntime } from "./codex-runtime.js";
+import { RuntimeManager, runtimeId } from "./runtime-manager.js";
 
 export class Manager {
   serial = new Serial();
+  settingsSerial = new Serial();
   closing = false;
   private recovering = false;
   private initialized = false;
   private retryTimer?: NodeJS.Timeout;
+  readonly runtimes: RuntimeManager;
+  readonly codex: CodexRuntime;
+  transitioning = false;
+  private transitionDone: Promise<void> = Promise.resolve();
+  private matrixConnected = new Set<string>();
   constructor(
     public store: Store,
     public pi: PiService,
     public gateway: Gateway,
+    runtimes?: RuntimeManager,
   ) {
+    void pi.ready?.catch(() => {});
+    for (const a of store.agents()) if (a.status === "Running") this.matrixConnected.add(a.id);
+    this.codex = new CodexRuntime(store.dir);
+    this.runtimes = runtimes ?? new RuntimeManager(
+      { pi: new PiRuntime(pi), codex: this.codex }, store.settings().runtime,
+    );
+    this.codex.onAuthenticationChanged = () => {
+      if (this.runtimes.selected === "codex" && !this.closing)
+        void this.refreshRuntimeAgents();
+    };
     gateway.on("event", (e) => {
       if (e.event === "message")
         void this.receive(e).catch((error) => {
@@ -36,6 +57,8 @@ export class Manager {
       if (e.event === "status" && e.agent_id) {
         try {
           const a = store.agent(e.agent_id);
+          if (e.status === "Running" || e.status === "running") this.matrixConnected.add(a.id);
+          else this.matrixConnected.delete(a.id);
           if (a.desired)
             store.status(
               a.id,
@@ -50,16 +73,18 @@ export class Manager {
       }
     });
     gateway.on("crash", () => {
+      this.matrixConnected.clear();
       if (!this.closing && this.initialized) void this.recover();
     });
   }
   async init() {
-    await this.pi.ready;
+    // A missing or unconfigured optional runtime must leave Settings accessible.
+    await this.runtimes.active.initialize().catch(() => {});
     await this.gateway.start();
     this.initialized = true;
     await this.restore();
     this.retryTimer = setInterval(() => {
-      if (this.closing) return;
+      if (this.closing || this.transitioning) return;
       for (const a of this.store
         .agents()
         .filter(
@@ -100,12 +125,36 @@ export class Manager {
     }
   }
   async restore() {
+    while (this.transitioning) await this.transitionDone;
+    if (this.closing) return;
     await Promise.allSettled(
       this.store
         .agents()
         .filter((a) => a.desired)
         .map((a) => this.serial.run(a.id, () => this.start(a.id))),
     );
+  }
+  /** Recover configured Agents after provider login without replacing live Matrix clients. */
+  async refreshRuntimeAgents() {
+    while (this.transitioning) await this.transitionDone;
+    if (this.closing) return;
+    await Promise.allSettled(this.store.agents().filter((a) => a.desired).map((a) =>
+      this.serial.run(a.id, async () => {
+        if (this.closing || !this.store.agent(a.id).desired) return;
+        try {
+          if (!this.matrixConnected.has(a.id)) {
+            await this.start(a.id);
+            return;
+          }
+          const current = this.store.agent(a.id);
+          await this.runtimes.active.initializeAgent({ id: a.id, instructions: current.instructions }, this.store.settings());
+          this.store.status(a.id, "Running");
+          if (await this.flush(a.id)) await this.process(a.id);
+        } catch (error) {
+          this.store.status(a.id, "Error", this.error(error));
+        }
+      }),
+    ));
   }
   private async start(id: string) {
     const a = this.store.agent(id),
@@ -116,7 +165,7 @@ export class Manager {
         throw new Error("Configure Matrix Server in Settings first.");
       if (!s.provider || !s.model)
         throw new Error("Configure a default model in Settings first.");
-      await this.pi.initializeAgent({ id, instructions: a.instructions }, s);
+      await this.runtimes.active.initializeAgent({ id, instructions: a.instructions }, s);
       const dir = join(this.store.dir, "matrix", id);
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       await this.gateway.request("start", {
@@ -129,6 +178,7 @@ export class Manager {
         display_name: a.display_name,
         avatar: a.avatar ? JSON.parse(a.avatar) : null,
       });
+      this.matrixConnected.add(id);
       const interrupted = this.store.db
         .prepare(
           "SELECT count(*) AS count FROM inbox WHERE agent_id=? AND state='interrupted'",
@@ -147,11 +197,16 @@ export class Manager {
     }
   }
   private error(e: unknown) {
-    return this.pi.sanitizeError(
+    return this.runtimes.active.sanitizeError(this.pi.sanitizeError(
       e instanceof Error ? e.message : "Operation failed.",
-    );
+    ));
+  }
+  private checkTransition() {
+    if (this.transitioning)
+      throw new AppError(409, "Agent Runtime is switching. Try again shortly.");
   }
   async create(body: any) {
+    this.checkTransition();
     const person = this.store.person(required(body.person_id, "Person"));
     const mxid = matrixId(body.matrix_id);
     if (person.matrix_id === mxid)
@@ -186,6 +241,7 @@ export class Manager {
     return this.public(this.store.agent(id));
   }
   async edit(id: string, body: any) {
+    this.checkTransition();
     return this.serial.run(id, async () => {
       const old = this.store.checkVersion(id, body.version);
       const mxid = matrixId(body.matrix_id),
@@ -222,8 +278,9 @@ export class Manager {
         if (body.password) this.store.setPassword(id, password(body.password));
       });
       if (old.desired || changedIdentity) {
-        await this.pi.stopAgent(id);
+        await this.runtimes.active.stopAgent(id);
         await this.gateway.request("stop", { agent_id: id });
+        this.matrixConnected.delete(id);
       }
       if (changedIdentity) this.resetMatrix(id);
       if (old.desired) await this.start(id);
@@ -231,14 +288,16 @@ export class Manager {
     });
   }
   async lifecycle(id: string, op: string, version: unknown) {
+    this.checkTransition();
     return this.serial.run(id, async () => {
       this.store.checkVersion(id, version);
       this.store.db
         .prepare("UPDATE agents SET desired=?,version=version+1 WHERE id=?")
         .run(op === "stop" ? 0 : 1, id);
       if (op !== "start") {
-        await this.pi.stopAgent(id);
+        await this.runtimes.active.stopAgent(id);
         await this.gateway.request("stop", { agent_id: id });
+        this.matrixConnected.delete(id);
         this.store.status(id, "Stopped");
       }
       if (op !== "stop") await this.start(id);
@@ -246,16 +305,19 @@ export class Manager {
     });
   }
   async delete(id: string, version: unknown) {
+    this.checkTransition();
     await this.serial.run(id, async () => {
       this.store.checkVersion(id, version);
-      await this.pi.stopAgent(id);
+      await Promise.all(Object.values(this.runtimes.adapters).map((runtime) => runtime.stopAgent(id)));
       await this.gateway.request("stop", { agent_id: id });
+      this.matrixConnected.delete(id);
       this.store.db.prepare("DELETE FROM agents WHERE id=?").run(id);
       for (const type of ["matrix", "agents"])
         rmSync(join(this.store.dir, type, id), {
           recursive: true,
           force: true,
         });
+      rmSync(join(this.store.dir, "codex", "agents", id), { recursive: true, force: true });
     });
   }
   public(a: Agent) {
@@ -282,8 +344,9 @@ export class Manager {
     await Promise.allSettled(
       this.store.agents().map((a) =>
         this.serial.run(a.id, async () => {
-          await this.pi.stopAgent(a.id);
+          await this.runtimes.active.stopAgent(a.id);
           await this.gateway.request("stop", { agent_id: a.id });
+          this.matrixConnected.delete(a.id);
           this.resetMatrix(a.id);
           if (a.desired) await this.start(a.id);
         }),
@@ -333,6 +396,7 @@ export class Manager {
       this.store.status(a.id, a.status, rejection);
       return;
     }
+    if (this.transitioning) return;
     await this.serial.run(a.id, async () => {
       const current = this.store.agent(a.id);
       if (!current.desired) return;
@@ -365,17 +429,18 @@ export class Manager {
       );
   }
   private async process(id: string) {
-    if (this.closing) return;
+    if (this.closing || this.transitioning) return;
     for (const item of this.store.pending(id)) {
       const a = this.store.agent(id);
-      if (!a.desired || a.status !== "Running" || this.closing) return;
+      if (!a.desired || a.status !== "Running" || this.closing || this.transitioning) return;
       let started = false;
       try {
         await this.validate(id, item.room_id);
+        if (this.closing || this.transitioning) return;
         const e = JSON.parse(item.payload);
         this.store.mark(id, item.event_id, "running");
         started = true;
-        const result = await this.pi.run(
+        const result = await this.runtimes.active.run(
           { id, instructions: a.instructions },
           this.store.settings(),
           e.body,
@@ -437,6 +502,7 @@ export class Manager {
     return true;
   }
   async proactive(id: string, body: any) {
+    this.checkTransition();
     return this.serial.run(id, async () => {
       const a = this.store.agent(id);
       if (a.status !== "Running")
@@ -473,9 +539,93 @@ export class Manager {
   async close() {
     this.closing = true;
     clearInterval(this.retryTimer);
-    await this.pi.close();
+    await this.runtimes.close();
+    await this.settingsSerial.drain();
     await this.serial.drain();
     await this.gateway.close();
     this.store.close();
+  }
+
+  /** Caller holds the global settings lock. Matrix admission stays durable throughout. */
+  async configure(next: Settings, drainTimeoutMs = 30_000) {
+    if (this.closing) throw new AppError(503, "The service is shutting down.");
+    const old = this.store.settings();
+    if (old.version !== next.version)
+      throw new AppError(409, "Settings changed in another browser. Reload before saving.");
+    const selected = runtimeId(next.runtime), target = this.runtimes.get(selected);
+    try {
+      await target.initialize();
+      const selection = await target.selection(next);
+      next = { ...next, runtime: selected, thinking_level: selection.thinking_level };
+      await target.validate(next);
+    } catch (error) {
+      throw new AppError(error instanceof AppError ? error.status : 400, target.sanitizeError(this.pi.sanitizeError(error)));
+    }
+    if (this.closing) throw new AppError(503, "The service is shutting down.");
+    const changedRuntime = selected !== this.runtimes.selected;
+    const changedServer = next.homeserver !== old.homeserver;
+    if (!changedRuntime && !changedServer) return this.store.saveSettings(next);
+
+    this.transitioning = true;
+    let resume!: () => void;
+    this.transitionDone = new Promise<void>((resolve) => { resume = resolve; });
+    const previous = this.runtimes.active;
+    let previousDeactivated = false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const drained = this.serial.drain();
+      const finished = await Promise.race([
+        drained.then(() => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), drainTimeoutMs); }),
+      ]);
+      clearTimeout(timer);
+      if (!finished) {
+        // Cancel without replaying an execution whose outcome may be unknown.
+        previousDeactivated = true;
+        await previous.deactivate();
+        await drained;
+      }
+      if (this.closing) throw new AppError(503, "The service is shutting down.");
+      if (changedRuntime)
+        for (const a of this.store.agents().filter((a) => a.desired))
+          await target.initializeAgent({ id: a.id, instructions: a.instructions }, next);
+      if (changedRuntime && !previousDeactivated) {
+        previousDeactivated = true;
+        await previous.deactivate();
+      }
+      const result = this.store.saveSettings(next);
+      this.runtimes.selected = selected;
+      // Keep old-server work isolated before any queued execution or delivery resumes.
+      if (changedServer) await this.reconnectAll();
+      for (const a of this.store.agents().filter((a) => a.desired))
+        if (this.matrixConnected.has(a.id)) this.store.status(a.id, "Running");
+      return result;
+    } catch (error) {
+      await target.deactivate().catch(() => {});
+      if (previousDeactivated && !this.closing) {
+        for (const a of this.store.agents().filter((a) => a.desired)) {
+          try {
+            await previous.initializeAgent({ id: a.id, instructions: a.instructions }, old);
+            this.store.status(a.id, "Running");
+          } catch (restoreError) {
+            this.store.status(a.id, "Error", this.error(restoreError));
+          }
+        }
+      }
+      throw new AppError(400, target.sanitizeError(this.pi.sanitizeError(error)));
+    } finally {
+      clearTimeout(timer);
+      this.transitioning = false;
+      resume();
+      if (!this.closing)
+        for (const a of this.store.agents().filter((a) => a.desired))
+          void this.serial.run(a.id, async () => {
+            if (!this.matrixConnected.has(a.id)) {
+              await this.start(a.id);
+              return;
+            }
+            if (await this.flush(a.id)) await this.process(a.id);
+          }).catch(() => {});
+    }
   }
 }

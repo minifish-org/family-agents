@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, Serial, matrixId, AppError } from "./store.js";
+import { DatabaseSync } from "node:sqlite";
 
 test("metadata transactions, protected credentials, deduplication and version conflicts", () => {
   const dir = mkdtempSync(join(tmpdir(), "family-store-"));
@@ -79,4 +80,33 @@ test("Matrix identities reject incomplete and unsafe input", () => {
   assert.equal(matrixId("@owner:example.org"), "@owner:example.org");
   for (const bad of ["owner", "@a", "@a:bad/path", "@a:bad host"])
     assert.throws(() => matrixId(bad));
+});
+
+test("legacy settings upgrade defaults to Pi and keeps independent runtime defaults after reopen", () => {
+  const dir = mkdtempSync(join(tmpdir(), "family-legacy-runtime-"));
+  const legacy = new DatabaseSync(join(dir, "application.sqlite"));
+  legacy.exec(`CREATE TABLE settings(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,homeserver TEXT NOT NULL,
+    provider TEXT NOT NULL,model TEXT NOT NULL,thinking_level TEXT NOT NULL);
+    INSERT INTO settings VALUES(1,12,'https://matrix.example.org','original-provider','original-model','high');`);
+  legacy.close();
+  let store = new Store(dir);
+  try {
+    assert.equal(store.settings().runtime, "pi");
+    assert.equal(store.settings().version, 12);
+    assert.equal(store.settings().model, "original-model");
+    const person = store.addPerson("@owner:example.org", "Owner");
+    store.db.prepare("INSERT INTO agents(id,person_id,matrix_id,display_name) VALUES('a',?,'@bot:example.org','Bot')").run(person.id);
+    store.setPassword("a", "original-password");
+    store.saveSettings({...store.settings(), runtime: "codex", provider: "codex", model: "discovered-model", thinking_level: "medium"});
+    const piDefaults = store.runtimeDefaults("pi") as {provider: string; model: string; thinking_level: string};
+    assert.equal(piDefaults.model, "original-model");
+    store.close(); store = new Store(dir);
+    assert.equal(store.settings().runtime, "codex");
+    assert.equal(store.password("a"), "original-password");
+    assert.equal(store.people()[0].id, person.id);
+    assert.equal(store.agent("a").person_id, person.id);
+    store.saveSettings({...store.settings(), ...piDefaults, runtime: "pi"});
+    assert.equal(store.settings().model, "original-model");
+    assert.equal(store.runtimeDefaults("codex").model, "discovered-model");
+  } finally { store.close(); rmSync(dir, {recursive: true, force: true}); }
 });

@@ -1,20 +1,20 @@
 # Family Agents
 
-Self-hosted AI assistants for your family, available through your existing Matrix clients.
+A private, self-hosted control panel for family AI assistants in encrypted Matrix chats.
 
-Family Agents gives each family member their own AI assistants, each with a dedicated Matrix account, name, avatar, and instructions. Use the web control panel to configure them, then chat in encrypted direct messages from your usual Matrix client.
+Give each family member their own assistants, each with a dedicated Matrix account, name, avatar, and instructions. Manage them from the private web panel, then chat through your existing Matrix client. Pi Coding Agent and Codex App Server provide the model runtimes; Family Agents handles owner-only routing, persistent reminders, document delivery, and local data tools.
 
-- **Personal assistants:** each Agent belongs to one Person and responds only to that owner's verified direct messages.
-- **Familiar chat:** conversations happen in Matrix; the web panel manages People, Agents, and shared settings.
-- **Your choice of model:** configure providers through the Pi SDK, including API keys and supported account sign-in flows.
-- **Two runtimes:** select Pi Coding Agent or Codex App Server globally in Settings, with independent saved defaults and conversation state.
-- **Persistent conversations:** each Agent keeps its own conversation across restarts, with automatic context compaction.
-- **Text and images:** use an image-capable model for image input; the fixed image tool can return an image attached to the current message.
-- **Everyday tools:** save reminders, request daily briefings, export CSV/PDF documents, and analyze table data with local Python statistics and charts.
+- **Owner-only Matrix chat:** each Agent responds to its owner's verified, encrypted direct messages through familiar Matrix clients.
+- **Pi and Codex runtimes:** select one runtime globally, with independent saved defaults and per-Agent conversations that survive restarts and use native context compaction.
+- **Provider and account sign-in:** use Pi's supported providers or Codex's separate ChatGPT subscription and API-key connections; capabilities depend on the selected model and account.
+- **Reminders and daily briefings:** save one-time reminders and daily subscriptions. Current-information briefings require Codex Native Login with working native live search and verified search results.
+- **Documents and data:** summarize encrypted attachments, export CSV/PDF files, and calculate local Python statistics with bar, line, scatter, and histogram charts.
+- **Text and images:** send images to a model that accepts them; use native Codex image generation where the connection, model, and account support it.
+- **Installable control panel:** open the panel in a standalone Chrome app window while conversations stay in Matrix.
 
 > The control panel has **no login or access controls**. Anyone who can reach it can manage all local configuration. Keep it on loopback or a trusted private network; do not expose it to the public Internet.
 
-[Requirements](#requirements) · [Installation](#installation) · [First conversation](#first-conversation) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Development](#development)
+[Requirements](#requirements) · [Installation](#installation) · [Install in Chrome](#install-the-control-panel-in-chrome) · [First conversation](#first-conversation) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
 ## How it works
 
@@ -99,6 +99,14 @@ ssh -N -L 18090:127.0.0.1:18090 user@your-server
 ```
 
 Then open `http://127.0.0.1:18090` on your computer. The server must be running Family Agents, and local port 18090 must be free.
+
+### Install the control panel in Chrome
+
+The control panel includes a web app manifest with standalone display mode. Open it in Chrome through `http://localhost:18090`, `http://127.0.0.1:18090`, or a trusted HTTPS address. For another machine, use the SSH tunnel above or HTTPS while keeping access private.
+
+Use **Install App** in the control panel, or Chrome's install option in the address bar or browser menu when available. Chrome decides whether and when to offer installation based on its own eligibility rules and your previous choices; an automatic prompt is not guaranteed on every visit. See [Chrome's installation criteria](https://web.dev/articles/install-criteria).
+
+Installation adds an app shortcut and a separate window for the same control panel. Assistants continue to run on the service host, which must stay running and connected to Matrix and the selected model provider.
 
 ## First conversation
 

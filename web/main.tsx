@@ -2,6 +2,7 @@ import React, { useEffect, useId, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 import familyIcon from "./icon.svg";
+import { InstallApp } from "./install-app";
 
 type Person = { id: string; matrix_id: string; display_name: string };
 type Agent = {
@@ -1816,31 +1817,34 @@ function App() {
           />
           Family Agents
         </a>
-        {!settings && (
-          <button className="secondary small" onClick={() => setSettings(true)}>
-            <svg
-              aria-hidden="true"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-            >
-              <path
-                d="m10 3-1 3-3 1-3 3 2 2-1 4 3 1 2 4h4l1-3 4-1 3-4-2-2 1-4-3-1-2-3h-5Z"
-                stroke="currentColor"
-                strokeWidth="1.5"
-              />
-              <circle
-                cx="12"
-                cy="12"
-                r="3"
-                stroke="currentColor"
-                strokeWidth="1.5"
-              />
-            </svg>
-            Settings
-          </button>
-        )}
+        <div className="header-actions">
+          <InstallApp />
+          {!settings && (
+            <button className="secondary small" onClick={() => setSettings(true)}>
+              <svg
+                aria-hidden="true"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+              >
+                <path
+                  d="m10 3-1 3-3 1-3 3 2 2-1 4 3 1 2 4h4l1-3 4-1 3-4-2-2 1-4-3-1-2-3h-5Z"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                />
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="3"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                />
+              </svg>
+              Settings
+            </button>
+          )}
+        </div>
       </header>
       <main>
         {settings ? (

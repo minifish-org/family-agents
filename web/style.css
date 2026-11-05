@@ -156,11 +156,25 @@ form > label + label {
 }
 header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 28px 0;
   border-bottom: 1px solid #e5ebf4;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+.install-hint {
+  max-width: 230px;
+  font-size: 12px;
+  color: #526b90;
 }
 .brand {
   display: inline-flex;
@@ -764,11 +778,11 @@ summary {
     width: 29px;
     height: 29px;
   }
-  header > .small {
+  .header-actions > .small {
     padding: 7px 10px;
     font-size: 11px;
   }
-  header > .small svg {
+  .header-actions > .small svg {
     width: 14px;
     height: 14px;
   }

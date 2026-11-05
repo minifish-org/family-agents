@@ -1,0 +1,17 @@
+{
+  "id": "/",
+  "name": "Family Agents",
+  "short_name": "Family Agents",
+  "description": "Manage your family's AI assistants for encrypted Matrix conversations.",
+  "lang": "en",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f8fc",
+  "theme_color": "#2964d6",
+  "prefer_related_applications": false,
+  "icons": [
+    { "src": "/assets/app-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

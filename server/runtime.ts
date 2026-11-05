@@ -8,6 +8,27 @@ export interface RuntimeDefaults {
 export interface RuntimeAgent {
   id: string;
   instructions?: string;
+  tools?: RuntimeTools;
+}
+export interface RuntimeToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+export interface RuntimeFile {
+  data: string;
+  mimeType: string;
+  name: string;
+}
+export interface RuntimeToolResult {
+  text: string;
+  files?: RuntimeFile[];
+  images?: RuntimeImage[];
+}
+/** The application captures owner, room and message identity in this per-run closure. */
+export interface RuntimeTools {
+  definitions: RuntimeToolDefinition[];
+  execute(name: string, args: unknown, context: { callId: string; signal: AbortSignal }): Promise<RuntimeToolResult>;
 }
 export interface RuntimeImage {
   type?: "image";
@@ -18,6 +39,8 @@ export interface RuntimeImage {
 export interface RuntimeReply {
   text: string;
   images: RuntimeImage[];
+  files?: RuntimeFile[];
+  usedWebSearch?: boolean;
 }
 export interface RuntimeModel {
   provider: string;

@@ -247,7 +247,7 @@ export class Store {
       .prepare("UPDATE inbox SET state=? WHERE agent_id=? AND event_id=?")
       .run(state, id, event);
   }
-  addOutbox(id: string, room: string, payload: unknown, txn = randomUUID()) {
+  addOutbox(id: string, room: string, payload: unknown, txn: string = randomUUID()) {
     this.db
       .prepare("INSERT INTO outbox VALUES(?,?,?,?,0,?)")
       .run(txn, id, room, JSON.stringify(payload), Date.now());

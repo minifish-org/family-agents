@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, existsSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Gateway } from "./gateway.js";
 import {
   Store,
@@ -19,14 +19,27 @@ import { PiRuntime } from "./pi-runtime.js";
 import { CodexRuntime } from "./codex-runtime.js";
 import { RuntimeManager, runtimeId } from "./runtime-manager.js";
 import { validateDocument, extractDocument } from "./documents.js";
+import { ScheduleStore, type ScheduleScope, type ScheduleClaim } from "./schedules.js";
+import { applicationTools, familyToolInstructions, familyTimeZone } from "./app-tools.js";
+import type { RuntimeAgent, RuntimeReply } from "./runtime.js";
+
+type ManagerOptions = { now?: () => number; progressDelayMs?: number; scheduleIntervalMs?: number };
+type Processing = { room_id: string; event_id: string; controller: AbortController };
 
 export class Manager {
   serial = new Serial();
   settingsSerial = new Serial();
+  private deliverySerial = new Serial();
   closing = false;
   private recovering = false;
   private initialized = false;
   private retryTimer?: NodeJS.Timeout;
+  private scheduleTimer?: NodeJS.Timeout;
+  private scheduleBusy = new Set<string>();
+  private reminderBusy = new Set<string>();
+  private scheduledOperations = new Set<Promise<unknown>>();
+  private processing = new Map<string, Processing>();
+  readonly schedules: ScheduleStore;
   readonly runtimes: RuntimeManager;
   readonly codex: CodexRuntime;
   transitioning = false;
@@ -37,10 +50,12 @@ export class Manager {
     public pi: PiService,
     public gateway: Gateway,
     runtimes?: RuntimeManager,
+    private options: ManagerOptions = {},
   ) {
     void pi.ready?.catch(() => {});
     for (const a of store.agents()) if (a.status === "Running") this.matrixConnected.add(a.id);
     this.codex = new CodexRuntime(store.dir);
+    this.schedules = new ScheduleStore(store.db, { now: options.now, defaultTimeZone: familyTimeZone() });
     this.runtimes = runtimes ?? new RuntimeManager(
       { pi: new PiRuntime(pi), codex: this.codex }, store.settings().runtime,
     );
@@ -103,6 +118,9 @@ export class Manager {
           .catch(() => {});
     }, 15_000);
     this.retryTimer.unref();
+    this.scheduleTimer = setInterval(() => { void this.pollScheduled().catch(() => {}); }, this.options.scheduleIntervalMs ?? 1000);
+    this.scheduleTimer.unref();
+    void this.pollScheduled().catch(() => {});
   }
   private async recover() {
     if (this.recovering) return;
@@ -150,7 +168,7 @@ export class Manager {
             return;
           }
           const current = this.store.agent(a.id);
-          await this.runtimes.active.initializeAgent({ id: a.id, instructions: current.instructions }, this.store.settings());
+          await this.runtimes.active.initializeAgent(this.runtimeAgent(current), this.store.settings());
           this.store.status(a.id, "Running");
           if (await this.flush(a.id)) await this.process(a.id);
         } catch (error) {
@@ -166,9 +184,11 @@ export class Manager {
     try {
       if (!s.homeserver)
         throw new Error("Configure Matrix Server in Settings first.");
-      if (!s.provider || !s.model)
-        throw new Error("Configure a default model in Settings first.");
-      await this.runtimes.active.initializeAgent({ id, instructions: a.instructions }, s);
+      let runtimeError: string | undefined;
+      try {
+        if (!s.provider || !s.model) throw new Error("Configure a default model in Settings first.");
+        await this.runtimes.active.initializeAgent(this.runtimeAgent(a), s);
+      } catch (error) { runtimeError = this.error(error); }
       const dir = join(this.store.dir, "matrix", id);
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       await this.gateway.request("start", {
@@ -182,6 +202,13 @@ export class Manager {
         avatar: a.avatar ? JSON.parse(a.avatar) : null,
       });
       this.matrixConnected.add(id);
+      if (runtimeError) {
+        this.store.status(id, "Error", runtimeError);
+        // Matrix delivery and saved reminders must survive unavailable model access.
+        await this.flush(id);
+        this.store.status(id, "Error", runtimeError);
+        return;
+      }
       const interrupted = this.store.db
         .prepare(
           "SELECT count(*) AS count FROM inbox WHERE agent_id=? AND state='interrupted'",
@@ -314,6 +341,7 @@ export class Manager {
       await Promise.all(Object.values(this.runtimes.adapters).map((runtime) => runtime.stopAgent(id)));
       await this.gateway.request("stop", { agent_id: id });
       this.matrixConnected.delete(id);
+      this.schedules.cancelAgent(id);
       this.store.db.prepare("DELETE FROM agents WHERE id=?").run(id);
       for (const type of ["matrix", "agents"])
         rmSync(join(this.store.dir, type, id), {
@@ -332,6 +360,7 @@ export class Manager {
     };
   }
   private resetMatrix(id: string) {
+    this.schedules.cancelAgent(id);
     const current = join(this.store.dir, "matrix", id);
     if (existsSync(current)) {
       const archive = join(this.store.dir, "matrix-archives");
@@ -403,9 +432,26 @@ export class Manager {
     });
     if (rejection) {
       this.store.status(a.id, a.status, rejection);
+      if (admitted && !this.transitioning) await this.serial.run(a.id, async () => {
+        try {
+          await this.validate(a.id, e.room_id);
+          this.queueNotice(a.id, e.room_id, `${e.event_id}:rejected`, `I couldn't process this attachment: ${rejection}`);
+          await this.flush(a.id);
+          this.store.status(a.id, a.status, rejection);
+        } catch {}
+      });
       return;
     }
     if (this.transitioning) return;
+    const processing = this.processing.get(a.id);
+    if (admitted && processing && processing.room_id === e.room_id && /^(?:cancel|stop|取消|停止|中止)(?:\s*(?:reply|response|processing|当前|本次|回答|回复|任务|处理|生成))*[.!！。]?$/i.test(e.body.trim())) {
+      await this.validate(a.id, e.room_id);
+      this.store.mark(a.id, e.event_id, "done");
+      processing.controller.abort();
+      void this.runtimes.active.stopAgent(a.id).catch(() => {});
+      await this.serial.run(a.id, async () => { if (this.store.agent(a.id).desired) await this.flush(a.id); });
+      return;
+    }
     await this.serial.run(a.id, async () => {
       const current = this.store.agent(a.id);
       if (!current.desired) return;
@@ -437,18 +483,202 @@ export class Manager {
         "This room is no longer an encrypted owner-only direct message.",
       );
   }
+
+  private scope(agent: Agent, room_id: string): ScheduleScope {
+    return {
+      agent_id: agent.id, room_id, homeserver: this.store.settings().homeserver,
+      agent_matrix_id: agent.matrix_id, owner_matrix_id: this.store.person(agent.person_id).matrix_id,
+    };
+  }
+  private currentScope(scope: ScheduleScope) {
+    const agent = this.store.agent(scope.agent_id), current = this.scope(agent, scope.room_id);
+    return agent.desired && (["agent_id", "room_id", "homeserver", "agent_matrix_id", "owner_matrix_id"] as const)
+      .every((key) => current[key] === scope[key]);
+  }
+  private requireBriefingSearch() {
+    const runtime = this.runtimes.active as typeof this.runtimes.active & { nativeWebSearchAvailable?: () => boolean };
+    if (this.runtimes.selected !== "codex" || !runtime.nativeWebSearchAvailable?.())
+      throw new AppError(400, "Daily briefings require Codex Native Login with live web search. The current connection cannot provide verified current information.");
+  }
+  private runtimeAgent(agent: Agent, run?: Processing, allowScheduling = true): RuntimeAgent {
+    const scope = run ? this.scope(agent, run.room_id) : undefined;
+    const tools = applicationTools(this.schedules, run && scope ? {
+      scope, source_event_id: run.event_id, allowScheduling,
+      check: async () => {
+        run.controller.signal.throwIfAborted();
+        if (this.closing || this.transitioning || !this.currentScope(scope)) throw new AppError(409, "The owner or Agent configuration changed. The operation was stopped.");
+        await this.validate(agent.id, run.room_id);
+        run.controller.signal.throwIfAborted();
+        if (this.closing || this.transitioning || !this.currentScope(scope)) throw new AppError(409, "The owner or Agent configuration changed. The operation was stopped.");
+      },
+      beforeBriefing: () => this.requireBriefingSearch(),
+    } : undefined);
+    return {
+      id: agent.id, instructions: [agent.instructions, familyToolInstructions()].filter(Boolean).join("\n\n"),
+      tools: { definitions: tools.definitions, execute: (name, args, context) => tools.execute(name, args, {
+        ...context, signal: run ? AbortSignal.any([context.signal, run.controller.signal]) : context.signal,
+      }) },
+    };
+  }
+  private noticeTransaction(id: string, key: string) {
+    return `notice-${createHash("sha256").update(`${id}:${key}`).digest("hex")}`;
+  }
+  private queueNotice(id: string, room: string, key: string, text: string) {
+    const txn = this.noticeTransaction(id, key);
+    if (!this.store.db.prepare("SELECT id FROM outbox WHERE id=?").get(txn))
+      this.store.addOutbox(id, room, { text }, txn);
+  }
+  private beginProcessing(id: string, run: Processing) {
+    this.processing.set(id, run);
+    const typing = () => {
+      if (!this.closing && this.processing.get(id) === run && !run.controller.signal.aborted)
+        void this.gateway.request("set_typing", { agent_id: id, room_id: run.room_id, typing: true }, 2000).catch(() => {});
+    };
+    typing();
+    const refresh = setInterval(typing, 12_000);
+    refresh.unref();
+    const progress = setTimeout(() => {
+      void (async () => {
+        if (this.closing || this.processing.get(id) !== run || run.controller.signal.aborted) return;
+        await this.validate(id, run.room_id);
+        if (this.closing || this.processing.get(id) !== run || run.controller.signal.aborted) return;
+        this.queueNotice(id, run.room_id, `${run.event_id}:progress`, "I'm still working on your reply. You can send 'cancel' to stop.");
+        await this.flush(id);
+      })().catch(() => {});
+    }, this.options.progressDelayMs ?? 20_000);
+    progress.unref();
+    return () => {
+      clearInterval(refresh); clearTimeout(progress);
+      if (this.processing.get(id) === run) this.processing.delete(id);
+      void this.gateway.request("set_typing", { agent_id: id, room_id: run.room_id, typing: false }, 2000).catch(() => {});
+    };
+  }
+  private queueReply(id: string, room: string, result: RuntimeReply, prefix?: string, scheduleScope?: ScheduleScope) {
+    const payloads: any[] = [];
+    let attachmentBytes = 0;
+    if (result.text.trim()) payloads.push({ text: result.text });
+    if ((result.files?.length ?? 0) > 4) throw new AppError(413, "A reply can contain at most four files.");
+    for (const img of result.images) {
+      const valid = image({ data: img.data, mime_type: img.mimeType })!;
+      attachmentBytes += Buffer.byteLength(valid.data, "base64");
+      payloads.push({ media: { ...valid, filename: img.name ?? "image.png" } });
+    }
+    for (const file of result.files ?? []) {
+      if (!["text/csv", "application/pdf"].includes(file.mimeType) || typeof file.data !== "string"
+        || !file.data.length || file.data.length > 11_184_812 || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.data)
+        || typeof file.name !== "string" || !file.name.trim() || file.name.length > 255 || file.name.trim() !== file.name
+        || file.name.startsWith(".") || /[\\/:*?"<>|\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(file.name))
+        throw new AppError(400, "The generated file cannot be delivered.");
+      const bytes = Buffer.from(file.data, "base64");
+      if (bytes.toString("base64") !== file.data || bytes.length > 8 * 1024 * 1024) throw new AppError(413, "Generated files must be no larger than 8 MiB.");
+      if (file.mimeType === "application/pdf") {
+        if (!file.name.toLowerCase().endsWith(".pdf") || !bytes.subarray(0, 5).equals(Buffer.from("%PDF-")) || !bytes.subarray(-2048).includes(Buffer.from("%%EOF")))
+          throw new AppError(400, "The generated PDF cannot be delivered.");
+      } else {
+        let text: string;
+        try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+        catch { throw new AppError(400, "The generated CSV cannot be delivered."); }
+        if (!file.name.toLowerCase().endsWith(".csv") || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(text))
+          throw new AppError(400, "The generated CSV cannot be delivered.");
+      }
+      attachmentBytes += bytes.length;
+      payloads.push({ file: { data: file.data, mime_type: file.mimeType, filename: file.name } });
+    }
+    if (attachmentBytes > 16 * 1024 * 1024) throw new AppError(413, "Reply attachments exceed the 16 MiB delivery limit.");
+    for (const [index, payload] of payloads.entries()) this.store.addOutbox(id, room,
+      { ...payload, ...(scheduleScope ? { schedule_scope: scheduleScope } : {}) }, prefix ? `${prefix}-${index}` : undefined);
+  }
+
+  /** Briefings share the Agent queue; immutable reminders deliver independently. */
+  async pollScheduled() {
+    if (this.closing || this.transitioning || !this.gateway.ready) return;
+    const operations: Promise<unknown>[] = [];
+    for (const agent of this.store.agents().filter((a) => a.desired && (this.matrixConnected.has(a.id) || a.status === "Running"))) {
+      const { room_id: _, ...identity } = this.scope(agent, "");
+      const due = this.schedules.dueForIdentity(identity);
+      // A reminder does not depend on the model and must not wait behind a long reply.
+      for (const job of due.filter((job) => job.kind === "reminder")) {
+        if (this.reminderBusy.has(job.id)) continue;
+        this.reminderBusy.add(job.id);
+        operations.push((async () => {
+          try { await this.validate(agent.id, job.room_id); }
+          catch { return; }
+          if (this.closing || this.transitioning || !this.currentScope(job)) return;
+          const claim = this.schedules.claim(job.id, job);
+          if (claim) await this.deliverScheduled(claim);
+          if (!this.closing && !this.transitioning) await this.flush(agent.id);
+        })().finally(() => { this.reminderBusy.delete(job.id); }));
+      }
+      if (!due.some((job) => job.kind === "briefing")) continue;
+      if (this.scheduleBusy.has(agent.id)) continue;
+      this.scheduleBusy.add(agent.id);
+      operations.push(this.serial.run(agent.id, async () => {
+        if (this.closing || this.transitioning || !this.store.agent(agent.id).desired) return;
+        const { room_id: _, ...identity } = this.scope(this.store.agent(agent.id), "");
+        for (const schedule of this.schedules.dueForIdentity(identity).filter((job) => job.kind === "briefing")) {
+          if (this.closing || this.transitioning) break;
+          try { await this.validate(agent.id, schedule.room_id); }
+          catch { this.schedules.hold(schedule, schedule.id, "This conversation is no longer an eligible owner direct message."); continue; }
+          if (this.closing || this.transitioning) break;
+          if (!this.currentScope(schedule)) continue;
+          const claim = this.schedules.claim(schedule.id, schedule);
+          if (claim) await this.deliverScheduled(claim);
+        }
+        if (!this.closing && !this.transitioning) await this.flush(agent.id);
+      }).finally(() => { this.scheduleBusy.delete(agent.id); }));
+    }
+    for (const operation of operations) this.scheduledOperations.add(operation);
+    try { await Promise.allSettled(operations); }
+    finally { for (const operation of operations) this.scheduledOperations.delete(operation); }
+  }
+  private async deliverScheduled(claim: ScheduleClaim) {
+    const job = claim.schedule, run: Processing = { room_id: job.room_id, event_id: `scheduled:${claim.run_id}`, controller: new AbortController() };
+    let stopFeedback: (() => void) | undefined;
+    try {
+      if (this.closing || this.transitioning || !this.currentScope(job)) throw new AppError(409, "The scheduled operation was stopped because its routing changed.");
+      let result: RuntimeReply;
+      if (job.kind === "reminder") {
+        const late = (this.options.now?.() ?? Date.now()) - claim.occurrence_at > 60_000;
+        result = { text: `${late ? "Delayed reminder" : "Reminder"}: ${job.text}`, images: [] };
+      } else {
+        this.requireBriefingSearch();
+        stopFeedback = this.beginProcessing(job.agent_id, run);
+        const prompt = `Prepare the daily briefing explicitly subscribed to by the owner. Current time: ${new Date(this.options.now?.() ?? Date.now()).toISOString()}. Owner timezone: ${job.time_zone}. Request: ${JSON.stringify(job.text)}. Use live web tools for current information and include source names and HTTPS URLs. Use native search_query to locate sources, even when weather or financial tools are also useful. If current information cannot be verified, explain the failure; never invent current facts. Do not create, cancel, or modify schedules. Reply only with the briefing.`;
+        result = await this.runtimes.active.run(this.runtimeAgent(this.store.agent(job.agent_id), run, false), this.store.settings(), prompt);
+        if (!result.usedWebSearch || !result.text.trim()) throw new AppError(400, "Live sources could not be verified. This briefing is paused; cancel and recreate it after reconnecting native web search.");
+      }
+      run.controller.signal.throwIfAborted();
+      await this.validate(job.agent_id, job.room_id);
+      if (this.closing || this.transitioning || !this.currentScope(job)) throw new AppError(409, "The scheduled operation was stopped because its routing changed.");
+      this.schedules.complete(claim, (txn) => this.queueReply(job.agent_id, job.room_id, result, txn, job));
+    } catch (error) {
+      const message = this.error(error).slice(0, 800);
+      if (job.kind === "reminder") {
+        // No outbox item was committed, so retrying this immutable reminder is safe.
+        this.schedules.returnReminder(claim);
+        return;
+      }
+      this.store.transaction(() => {
+        if (this.schedules.fail(claim, message) && !this.closing && this.currentScope(job))
+          this.queueNotice(job.agent_id, job.room_id, `${claim.run_id}:failed`, `Scheduled ${job.kind} paused: ${message}`);
+      });
+    } finally { stopFeedback?.(); }
+  }
   private async process(id: string) {
     if (this.closing || this.transitioning) return;
     for (const item of this.store.pending(id)) {
       const a = this.store.agent(id);
       if (!a.desired || a.status !== "Running" || this.closing || this.transitioning) return;
       let started = false;
+      let run: Processing | undefined, stopFeedback: (() => void) | undefined;
       try {
         await this.validate(id, item.room_id);
         if (this.closing || this.transitioning) return;
         const e = JSON.parse(item.payload);
         this.store.mark(id, item.event_id, "running");
         started = true;
+        run = { room_id: item.room_id, event_id: item.event_id, controller: new AbortController() };
+        stopFeedback = this.beginProcessing(id, run);
         let input = e.body;
         if (e.document) {
           const document = validateDocument(e.document);
@@ -460,6 +690,7 @@ export class Manager {
           if (budget < 1024)
             throw new AppError(400, "The document request is too long. Send a shorter caption.");
           const extracted = await extractDocument(document);
+          run.controller.signal.throwIfAborted();
           input = prefix + (extracted.length > budget ? extracted.slice(0, budget) + truncation : extracted) + suffix;
           if (this.closing || this.transitioning) {
             // No model call has begun, so the prepared input remains safe to retry.
@@ -472,8 +703,9 @@ export class Manager {
             return;
           }
         }
+        run.controller.signal.throwIfAborted();
         const result = await this.runtimes.active.run(
-          { id, instructions: a.instructions },
+          this.runtimeAgent(a, run),
           this.store.settings(),
           input,
           e.media
@@ -486,39 +718,41 @@ export class Manager {
               ]
             : [],
         );
+        run.controller.signal.throwIfAborted();
         this.store.transaction(() => {
-          if (result.text.trim())
-            this.store.addOutbox(id, item.room_id, { text: result.text });
-          for (const img of result.images)
-            this.store.addOutbox(id, item.room_id, {
-              media: {
-                data: img.data,
-                mime_type: img.mimeType,
-                filename: img.name ?? "image.png",
-              },
-            });
+          this.queueReply(id, item.room_id, result);
           this.store.mark(id, item.event_id, "done");
         });
         this.store.status(id, "Running");
         await this.flush(id);
       } catch (e) {
-        if (started) this.store.mark(id, item.event_id, "failed");
-        this.store.status(id, "Error", this.error(e));
+        const message = run?.controller.signal.aborted ? "Reply cancelled. Previously saved schedules are unchanged." : this.error(e);
+        if (started) this.store.transaction(() => {
+          this.store.mark(id, item.event_id, "failed");
+          if (!this.closing) this.queueNotice(id, item.room_id, `${item.event_id}:failed`, message);
+        });
+        if (!this.closing && started) await this.flush(id).catch(() => false);
+        this.store.status(id, "Error", message);
         return;
-      }
+      } finally { stopFeedback?.(); }
     }
   }
-  private async flush(id: string) {
+  private flush(id: string) {
+    return this.deliverySerial.run(id, () => this.flushCurrent(id));
+  }
+  private async flushCurrent(id: string) {
     const hadPending = this.store.outbox(id).length > 0;
     for (const out of this.store.outbox(id)) {
       try {
-        await this.validate(id, out.room_id);
         const p = JSON.parse(out.payload);
-        await this.gateway.request(p.media ? "send_media" : "send_message", {
+        if (p.schedule_scope && !this.currentScope(p.schedule_scope)) { this.store.sent(out.id); continue; }
+        await this.validate(id, out.room_id);
+        if (p.schedule_scope && !this.currentScope(p.schedule_scope)) { this.store.sent(out.id); continue; }
+        await this.gateway.request(p.media ? "send_media" : p.file ? "send_file" : "send_message", {
           agent_id: id,
           room_id: out.room_id,
           txn_id: out.id,
-          ...(p.media ? p.media : { text: p.text }),
+          ...(p.media ? p.media : p.file ? p.file : { text: p.text }),
         });
         this.store.sent(out.id);
       } catch (e) {
@@ -530,7 +764,7 @@ export class Manager {
         return false;
       }
     }
-    if (hadPending) this.store.status(id, "Running");
+    if (hadPending && this.store.agent(id).error?.startsWith("Reply delivery pending:")) this.store.status(id, "Running");
     return true;
   }
   async proactive(id: string, body: any) {
@@ -571,9 +805,13 @@ export class Manager {
   async close() {
     this.closing = true;
     clearInterval(this.retryTimer);
+    clearInterval(this.scheduleTimer);
+    for (const run of this.processing.values()) run.controller.abort();
     await this.runtimes.close();
     await this.settingsSerial.drain();
     await this.serial.drain();
+    await Promise.allSettled([...this.scheduledOperations]);
+    await this.deliverySerial.drain();
     await this.gateway.close();
     this.store.close();
   }
@@ -605,7 +843,7 @@ export class Manager {
     let previousDeactivated = false;
     let timer: NodeJS.Timeout | undefined;
     try {
-      const drained = this.serial.drain();
+      const drained = Promise.all([this.serial.drain(), this.deliverySerial.drain()]);
       const finished = await Promise.race([
         drained.then(() => true),
         new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), drainTimeoutMs); }),
@@ -620,7 +858,7 @@ export class Manager {
       if (this.closing) throw new AppError(503, "The service is shutting down.");
       if (changedRuntime)
         for (const a of this.store.agents().filter((a) => a.desired))
-          await target.initializeAgent({ id: a.id, instructions: a.instructions }, next);
+          await target.initializeAgent(this.runtimeAgent(a), next);
       if (changedRuntime && !previousDeactivated) {
         previousDeactivated = true;
         await previous.deactivate();
@@ -637,7 +875,7 @@ export class Manager {
       if (previousDeactivated && !this.closing) {
         for (const a of this.store.agents().filter((a) => a.desired)) {
           try {
-            await previous.initializeAgent({ id: a.id, instructions: a.instructions }, old);
+            await previous.initializeAgent(this.runtimeAgent(a), old);
             this.store.status(a.id, "Running");
           } catch (restoreError) {
             this.store.status(a.id, "Error", this.error(restoreError));

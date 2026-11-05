@@ -429,6 +429,9 @@ test("cached native ChatGPT credentials require explicit selection before author
     f.client.accountType = "chatgpt";
     writeFileSync(join(f.client.homeDir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: "fixture-native-token"}}));
     const account = await f.runtime.account();
+    const beforeCapabilityRead = f.client.calls.length;
+    assert.equal(f.runtime.nativeWebSearchAvailable(), false);
+    assert.equal(f.client.calls.length, beforeCapabilityRead, "capability checks must not acquire a nested model lease");
     assert.equal(account.authenticated, false); assert.equal(account.auth_method, "siwc");
     assert.equal(account.connections.codex.configured, true);
     await assert.rejects(f.runtime.run({id: "a"}, defaults, "Never legacy"), /authentication/);
@@ -436,6 +439,24 @@ test("cached native ChatGPT credentials require explicit selection before author
     await f.runtime.selectAuthMethod({method: "codex", version: (await f.runtime.account()).version});
     assert.equal((await f.runtime.account()).auth_method, "codex");
     assert.equal((await f.runtime.account()).authenticated, true);
+    assert.equal(f.runtime.nativeWebSearchAvailable(), true);
+  } finally { await f.close(); }
+});
+
+test("briefing search evidence requires completed nonempty structured results rather than a search attempt", async () => {
+  const f = fixture();
+  try {
+    let results: unknown = null;
+    f.client.onTurn = (params, turnId) => {
+      f.client.notify("item/started", { threadId: params.threadId, turnId, item: { type: "webSearch", id: "search", results: [{ shouldNotCount: true }] } });
+      f.client.notify("item/completed", { threadId: params.threadId, turnId, item: { type: "webSearch", id: "search", results } });
+      f.client.complete(params.threadId, turnId, "Search handled.");
+    };
+    assert.equal((await f.runtime.run({ id: "a" }, defaults, "Denied search")).usedWebSearch, undefined);
+    results = [];
+    assert.equal((await f.runtime.run({ id: "a" }, defaults, "No results")).usedWebSearch, undefined);
+    results = [{ url: "https://example.org/current-news", title: "Current source" }];
+    assert.equal((await f.runtime.run({ id: "a" }, defaults, "Search succeeded")).usedWebSearch, true);
   } finally { await f.close(); }
 });
 

@@ -1618,7 +1618,14 @@ function SettingsPage({ onBack }: { onBack: () => void }) {
           <section className="panel">
             <h2>Files in Matrix</h2>
             <p className="hint">Send an encrypted text, code, CSV, PDF, Word (.docx), or Excel (.xlsx) attachment to your Agent. Add a message asking for a summary, comparison, or analysis. Files can be up to 8 MiB; long documents are shortened to fit the conversation.</p>
+            <p className="hint">Ask for a CSV or PDF export to receive a file back. Table data can also be analyzed with local Python statistics, grouped totals, correlation, and bar, line, scatter, or histogram charts.</p>
             <p className="hint">PDFs need selectable text. Scanned pages can be sent as images for a model that supports image understanding.</p>
+          </section>
+          <section className="panel">
+            <h2>Reminders and Daily Briefings</h2>
+            <p className="hint">Ask your Agent to save a one-time reminder, list reminders, or cancel one. The confirmation includes its local time, timezone, and ID. Saved reminders survive service restarts.</p>
+            <p className="hint">Daily weather and news briefings require Codex Native Login with working live search. Ask for a daily time and topics, or ask to list or cancel subscriptions. Briefings use your existing model allowance.</p>
+            <p className="hint">An in-progress reply shows a typing indicator and a message if it takes longer. Send “cancel” to stop the current reply.</p>
           </section>
           <section className="panel">
             <h2>Default Model</h2>

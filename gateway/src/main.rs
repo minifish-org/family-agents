@@ -22,7 +22,7 @@ use matrix_sdk::{
                 ImageInfo, MediaSource,
                 member::StrippedRoomMemberEvent,
                 message::{
-                    FileMessageEventContent, ImageMessageEventContent, MessageType,
+                    FileInfo, FileMessageEventContent, ImageMessageEventContent, MessageType,
                     OriginalSyncRoomMessageEvent, RoomMessageEventContent,
                 },
             },
@@ -333,6 +333,61 @@ fn decode_media(media: &Media) -> Result<(Vec<u8>, mime::Mime)> {
     Ok((bytes, content_type))
 }
 
+fn decode_file(media: &Media) -> Result<(Vec<u8>, mime::Mime)> {
+    if media.filename.is_empty()
+        || media.filename.chars().count() > 255
+        || media.filename.trim() != media.filename
+        || media.filename.starts_with('.')
+        || media.filename.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        bail!("A safe file basename is required");
+    }
+    if media.data.is_empty() || media.data.len() > MAX_MEDIA.div_ceil(3) * 4 {
+        bail!("Files must contain between 1 byte and 8 MiB");
+    }
+    let content_type: mime::Mime = media
+        .mime_type
+        .parse()
+        .context("Invalid file content type")?;
+    let extension = media
+        .filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(
+        (content_type.essence_str(), extension.as_str()),
+        ("application/pdf", "pdf") | ("text/csv", "csv")
+    ) {
+        bail!("Only PDF and CSV exports are supported");
+    }
+    let bytes = BASE64.decode(&media.data).context("Invalid base64 file")?;
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA || BASE64.encode(&bytes) != media.data {
+        bail!("Files must use canonical base64 and be no larger than 8 MiB");
+    }
+    if content_type.essence_str() == "application/pdf" {
+        if !bytes.starts_with(b"%PDF-")
+            || !bytes[bytes.len().saturating_sub(2048)..]
+                .windows(5)
+                .any(|window| window == b"%%EOF")
+        {
+            bail!("The PDF export is invalid");
+        }
+    } else {
+        let text = std::str::from_utf8(&bytes).context("CSV exports must use UTF-8")?;
+        if text
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\r' | '\n' | '\t'))
+        {
+            bail!("The CSV export contains invalid text");
+        }
+    }
+    Ok((bytes, content_type))
+}
+
 fn document_rejection(file: &FileMessageEventContent) -> Option<&'static str> {
     if !matches!(file.source, MediaSource::Encrypted(_)) {
         return Some("Document attachments must be encrypted.");
@@ -349,27 +404,82 @@ fn document_rejection(file: &FileMessageEventContent) -> Option<&'static str> {
     if filename.is_empty() || filename.len() > 1024 {
         return Some("The document filename is missing or too long.");
     }
-    let extension = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let supported_extension = matches!(
         extension.as_str(),
-        "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "json" | "jsonl"
-            | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "js" | "mjs"
-            | "cjs" | "jsx" | "ts" | "tsx" | "py" | "rs" | "go" | "java"
-            | "c" | "h" | "cpp" | "hpp" | "cs" | "rb" | "php" | "sh"
-            | "bash" | "sql" | "toml" | "ini" | "log" | "rst" | "tex"
-            | "pdf" | "docx" | "xlsx"
+        "txt"
+            | "text"
+            | "md"
+            | "markdown"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "py"
+            | "rs"
+            | "go"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cs"
+            | "rb"
+            | "php"
+            | "sh"
+            | "bash"
+            | "sql"
+            | "toml"
+            | "ini"
+            | "log"
+            | "rst"
+            | "tex"
+            | "pdf"
+            | "docx"
+            | "xlsx"
     );
-    let mime = file.info.as_ref().and_then(|info| info.mimetype.as_deref()).unwrap_or("")
-        .split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    let supported_mime = mime.starts_with("text/") || matches!(
-        mime.as_str(),
-        "application/json" | "application/ld+json" | "application/x-ndjson"
-            | "application/jsonl" | "application/xml" | "application/yaml"
-            | "application/x-yaml" | "application/javascript" | "application/x-javascript"
-            | "application/pdf"
-            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
+    let mime = file
+        .info
+        .as_ref()
+        .and_then(|info| info.mimetype.as_deref())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let supported_mime = mime.starts_with("text/")
+        || matches!(
+            mime.as_str(),
+            "application/json"
+                | "application/ld+json"
+                | "application/x-ndjson"
+                | "application/jsonl"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/pdf"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
     if !supported_extension && !supported_mime {
         return Some("Unsupported document. Send text, source code, PDF, DOCX, or XLSX.");
     }
@@ -934,7 +1044,7 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
             .await?;
             Ok(json!({}))
         }
-        "validate_room" | "send_message" | "send_media" => {
+        "validate_room" | "send_message" | "send_media" | "send_file" | "set_typing" => {
             let client = account.client.as_ref().context("Agent is stopped")?;
             let config = account
                 .config
@@ -947,6 +1057,14 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
             let members = validate_room(client, &room, config, false).await?;
             if op == "validate_room" {
                 return Ok(json!({"is_direct":true,"members":members,"encrypted":true}));
+            }
+            if op == "set_typing" {
+                let typing = request
+                    .get("typing")
+                    .and_then(Value::as_bool)
+                    .context("Typing must be true or false")?;
+                room.typing_notice(typing).await?;
+                return Ok(json!({}));
             }
             let txn = string(request, "txn_id")?;
             if txn.is_empty() || txn.len() > 255 {
@@ -962,18 +1080,32 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                     .event_id
             } else {
                 let media: Media = serde_json::from_value(request.clone())?;
-                let (bytes, mime) = decode_media(&media)?;
+                let (bytes, mime) = if op == "send_file" {
+                    decode_file(&media)?
+                } else {
+                    decode_media(&media)?
+                };
                 let length = bytes.len();
                 let mut reader = std::io::Cursor::new(bytes);
                 let file = client.upload_encrypted_file(&mut reader).await?;
                 // Upload precedes a fresh membership check; uploaded bytes disclose no plaintext.
                 validate_room(client, &room, config, false).await?;
-                let mut info = ImageInfo::new();
-                info.mimetype = Some(mime.to_string());
-                info.size = Some((length as u32).into());
-                let image = ImageMessageEventContent::encrypted(media.filename, file)
-                    .info(Some(Box::new(info)));
-                room.send(RoomMessageEventContent::new(MessageType::Image(image)))
+                let content = if op == "send_file" {
+                    let mut info = FileInfo::new();
+                    info.mimetype = Some(mime.to_string());
+                    info.size = Some((length as u32).into());
+                    let content = FileMessageEventContent::encrypted(media.filename, file)
+                        .info(Some(Box::new(info)));
+                    RoomMessageEventContent::new(MessageType::File(content))
+                } else {
+                    let mut info = ImageInfo::new();
+                    info.mimetype = Some(mime.to_string());
+                    info.size = Some((length as u32).into());
+                    let content = ImageMessageEventContent::encrypted(media.filename, file)
+                        .info(Some(Box::new(info)));
+                    RoomMessageEventContent::new(MessageType::Image(content))
+                };
+                room.send(content)
                     .with_transaction_id(txn)
                     .await?
                     .response
@@ -1198,6 +1330,72 @@ mod tests {
         );
     }
     #[test]
+    fn exported_files_require_safe_matching_names_and_valid_bounded_content() {
+        let file = |data: &[u8], mime_type: &str, filename: &str| Media {
+            data: BASE64.encode(data),
+            mime_type: mime_type.into(),
+            filename: filename.into(),
+        };
+        assert!(
+            decode_file(&file(
+                b"%PDF-1.4\nexport fixture\n%%EOF\n",
+                "application/pdf",
+                "家庭预算.pdf"
+            ))
+            .is_ok()
+        );
+        assert!(
+            decode_file(&file(
+                "\u{feff}\"项目\",\"金额\"\r\n\"食品\",42\r\n".as_bytes(),
+                "text/csv",
+                "家庭预算.csv"
+            ))
+            .is_ok()
+        );
+        for filename in [
+            "../report.pdf",
+            "folder/report.pdf",
+            "folder\\report.pdf",
+            "C:report.pdf",
+            ".report.pdf",
+            "report.pdf ",
+            "report\n.pdf",
+            "report\u{202e}.pdf",
+            "",
+        ] {
+            assert!(decode_file(&file(b"%PDF-1.4\n%%EOF", "application/pdf", filename)).is_err());
+        }
+        assert!(decode_file(&file(b"%PDF-1.4\n%%EOF", "application/pdf", "report.csv")).is_err());
+        assert!(
+            decode_file(&file(
+                b"<html>not a PDF</html>",
+                "application/pdf",
+                "report.pdf"
+            ))
+            .is_err()
+        );
+        assert!(
+            decode_file(&file(
+                b"%PDF-missing-footer",
+                "application/pdf",
+                "report.pdf"
+            ))
+            .is_err()
+        );
+        assert!(decode_file(&file(&[0xff, 0xfe], "text/csv", "report.csv")).is_err());
+        assert!(decode_file(&file(b"a,\0b", "text/csv", "report.csv")).is_err());
+        assert!(decode_file(&file(b"anything", "text/html", "report.html")).is_err());
+        assert!(decode_file(&file(b"", "text/csv", "report.csv")).is_err());
+        assert!(decode_file(&file(&vec![b'x'; MAX_MEDIA + 1], "text/csv", "report.csv")).is_err());
+        let mut invalid = file(b"valid,csv", "text/csv", "report.csv");
+        invalid.data = "Zh==".into();
+        assert!(decode_file(&invalid).is_err());
+        invalid.data = "bad!".into();
+        assert!(decode_file(&invalid).is_err());
+        // The existing avatar/image path remains image-only.
+        assert!(decode_media(&file(b"%PDF-1.4\n%%EOF", "application/pdf", "report.pdf")).is_err());
+    }
+    #[test]
     fn documents_require_encrypted_sources_supported_formats_and_bounded_size() {
         let content = |filename: &str, mime_type: &str, size: usize| {
             serde_json::from_value::<FileMessageEventContent>(json!({
@@ -1217,16 +1415,34 @@ mod tests {
             ("table.csv", "text/csv"),
             ("source.rs", "application/octet-stream"),
             ("report.pdf", "application/pdf"),
-            ("report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-            ("table.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            (
+                "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            (
+                "table.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
         ] {
-            assert_eq!(document_rejection(&content(filename, mime_type, MAX_MEDIA)), None);
+            assert_eq!(
+                document_rejection(&content(filename, mime_type, MAX_MEDIA)),
+                None
+            );
         }
         let mut unencrypted = content("notes.txt", "text/plain", 3);
-        unencrypted.source = MediaSource::Plain("mxc://example.org/plain".try_into().unwrap());
-        assert_eq!(document_rejection(&unencrypted), Some("Document attachments must be encrypted."));
-        assert_eq!(document_rejection(&content("notes.txt", "text/plain", MAX_MEDIA + 1)), Some("Documents must be no larger than 8 MiB."));
-        assert_eq!(document_rejection(&content("archive.zip", "application/zip", 3)), Some("Unsupported document. Send text, source code, PDF, DOCX, or XLSX."));
+        unencrypted.source = MediaSource::Plain("mxc://example.org/plain".into());
+        assert_eq!(
+            document_rejection(&unencrypted),
+            Some("Document attachments must be encrypted.")
+        );
+        assert_eq!(
+            document_rejection(&content("notes.txt", "text/plain", MAX_MEDIA + 1)),
+            Some("Documents must be no larger than 8 MiB.")
+        );
+        assert_eq!(
+            document_rejection(&content("archive.zip", "application/zip", 3)),
+            Some("Unsupported document. Send text, source code, PDF, DOCX, or XLSX.")
+        );
         assert!(document_rejection(&content("", "text/plain", 3)).is_some());
         let mut captioned = content("report.pdf", "application/pdf", 3);
         captioned.body = "Summarize this report.".into();
@@ -1253,6 +1469,15 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn file_and_typing_commands_cannot_run_without_an_active_agent() {
+        let accounts: Accounts = Arc::new(Mutex::new(HashMap::new()));
+        let (out, _) = mpsc::channel(8);
+        for op in ["send_file", "set_typing"] {
+            let result = command(&json!({"v":1,"op":op,"agent_id":"stopped","room_id":"!owner:example.org","typing":true,"txn_id":"stable"}), &accounts, &out).await;
+            assert!(result.unwrap_err().to_string().contains("Agent is stopped"));
+        }
     }
     #[tokio::test]
     async fn spool_commit_and_ack_are_private_and_durable() {

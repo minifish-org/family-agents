@@ -10,6 +10,7 @@ Family Agents gives each family member their own AI assistants, each with a dedi
 - **Two runtimes:** select Pi Coding Agent or Codex App Server globally in Settings, with independent saved defaults and conversation state.
 - **Persistent conversations:** each Agent keeps its own conversation across restarts, with automatic context compaction.
 - **Text and images:** use an image-capable model for image input; the fixed image tool can return an image attached to the current message.
+- **Everyday tools:** save reminders, request daily briefings, export CSV/PDF documents, and analyze table data with local Python statistics and charts.
 
 > The control panel has **no login or access controls**. Anyone who can reach it can manage all local configuration. Keep it on loopback or a trusted private network; do not expose it to the public Internet.
 
@@ -34,7 +35,7 @@ Private web control panel
 
 Only encrypted, invite-only, one-to-one direct messages between an Agent and its owner are accepted. Group chats, outsiders, and self messages do not trigger replies. Existing eligible direct conversations are discovered automatically.
 
-Matrix encryption protects messages in transit between clients. The Agent decrypts accepted messages and sends their content to the configured runtime's model provider for a response. Pi has no shell, filesystem, MCP, or arbitrary network tools. Codex disables execution and extension discovery, uses a read-only sandbox, and retains native live web search when supported by the model and account.
+Matrix encryption protects messages in transit between clients. The Agent decrypts accepted messages and sends their content to the configured runtime's model provider for a response. Pi and Codex share a fixed set of application tools with owner and room checks. Neither exposes general shell, filesystem, or network execution. Codex denies native filesystem access and disables extension discovery, while retaining native live web search when supported by the model and account. Its application tools use an authenticated loopback bridge inside the existing Node process; no external tool server or discovery is enabled.
 
 ## Requirements
 
@@ -52,13 +53,14 @@ To build from source, install:
 | Node.js | 24 or later, with npm |
 | Rust and Cargo | Rust 1.96 or later |
 | Native build tools | C/C++ compiler, `pkg-config`, and OpenSSL development files |
+| Document and chart tools | Python 3 with `venv`, the pinned Python packages below, and Poppler's `pdftotext` |
 | Other tools | Git and `tar` |
 
 On Debian/Ubuntu, install the native build dependencies with:
 
 ```sh
 sudo apt-get update
-sudo apt-get install build-essential pkg-config libssl-dev git tar
+sudo apt-get install build-essential pkg-config libssl-dev git tar python3 python3-venv poppler-utils
 ```
 
 Install Node.js and Rust separately at the versions above. The commands below use a Unix shell.
@@ -73,10 +75,20 @@ cd family-agents
 npm ci
 npm run build
 npm run gateway:build
-npm start
 ```
 
 Run these commands from the repository root. The first Rust build compiles the Matrix SDK and may take some time.
+
+Install the pinned local PDF/chart dependencies into a virtual environment, then start the application with that interpreter:
+
+```sh
+python3 -m venv "$HOME/.local/opt/family-agents-python"
+"$HOME/.local/opt/family-agents-python/bin/python3" -m pip install -r deploy/python-requirements.txt
+export FAMILY_PYTHON_BIN="$HOME/.local/opt/family-agents-python/bin/python3"
+npm start
+```
+
+The Python worker runs fixed local operations; it does not accept Python programs from chat. CSV export and saved reminder delivery do not require Python. The worker uses the interpreter selected by `FAMILY_PYTHON_BIN`, so keep this setting in your service environment after installation.
 
 Open **http://127.0.0.1:18090** on the same machine. Keep the terminal running; press `Ctrl+C` to stop the application gracefully. Node starts and supervises the Rust Gateway automatically.
 
@@ -115,6 +127,36 @@ The Agent replies in the same Matrix room. Conversation state is restored after 
 
 Open an Agent in the web panel to edit its details or use **Start**, **Stop**, and **Restart**. Leave the password blank while editing to keep the stored password.
 
+### Tools in your Matrix conversation
+
+Ask in ordinary language, for example:
+
+- "Remind me in 20 minutes to take the bread out of the oven."
+- "Show my reminders." Then: "Cancel reminder [the ID from the list]."
+- "Every day at 08:00 Asia/Singapore, send me a briefing about major technology news."
+- "Show my briefing subscriptions." Then: "Cancel briefing [the ID from the list]."
+- "Export this household budget as a CSV," or "Make a PDF of this summary."
+- "Using this CSV, calculate monthly totals and draw a bar chart."
+
+Both runtimes expose these eight fixed application tools:
+
+| Tools | Purpose |
+| --- | --- |
+| `reminder_create`, `reminder_list`, `reminder_cancel` | Save, view, and cancel one-time reminders in the current owner conversation. |
+| `briefing_subscribe`, `briefing_list`, `briefing_cancel` | Subscribe to, view, and cancel a daily briefing at a local time. |
+| `export_file` | Create a CSV table or a PDF containing text and tables. |
+| `python_analyze` | Calculate descriptive statistics, grouped sums/means/counts, or correlations; optionally return a bar, line, scatter, or histogram chart as a Matrix image. |
+
+Daily briefings currently require **Codex App Server** with **Codex Native Login** and native live web search. The other application tools work with either runtime, including the new Sign in with ChatGPT connection. A briefing is delivered only after the runtime reports a successful native search with usable results; a model's claim that it checked the news is insufficient. Search failures pause the subscription and report the problem. After restoring search access, cancel and recreate a paused subscription.
+
+Schedules are created only from the owner's explicit request. The confirmation contains the saved ID and resolved local date, time, and timezone. The default timezone is `Asia/Singapore`; ask for an IANA timezone such as `Europe/London` when needed. Reminders can be from one second to 365 days ahead. Briefings run daily at `HH:mm`, follow local daylight-saving changes, and do not offer arbitrary cron expressions. Each Agent can have 20 active schedules, including paused schedules that need attention.
+
+Saved schedules survive restarts and remain bound to the original homeserver, Agent account, owner account, and room. Listing and cancellation use that same scope. Stop pauses delivery; Start resumes due work. Late reminders are marked as late. Briefings skip missed repetitions instead of sending a burst. A briefing interrupted during model execution needs attention and is never automatically run again. Reminder delivery uses the saved text without calling a model and can continue while a model connection has an error, provided the Agent is started and Matrix is connected. A long model reply does not block due reminders.
+
+The Agent shows a typing indicator while processing and sends a progress notice for a slow reply. Send `cancel` or `取消` in the same owner conversation to stop the current reply. Already saved schedules remain saved; cancel a particular schedule by its ID. Failures produce a message in the owner conversation when delivery is available. Completed files and charts arrive as encrypted Matrix attachments after the reply.
+
+Exports and analysis accept at most 2 MiB of structured input, 30 columns, and 5,000 rows; PDF tables are limited to 1,000 rows and PDF text to 48,000 characters. Table cells can contain up to 4,096 characters. Grouped analysis accepts at most 100 groups. Each analysis call can produce one PNG chart; bar charts display the first 100 records while statistics still use all rows, and histograms accept 5–100 bins. Each generated file or chart is limited to 8 MiB; a reply can contain at most four files, with 16 MiB total across files and images. The tools accept data and named operations, never arbitrary code, local paths, shell commands, or URLs to execute.
+
 ## Configuration
 
 Set environment variables in the shell or service manager that starts the application:
@@ -126,6 +168,8 @@ Set environment variables in the shell or service manager that starts the applic
 | `DATA_DIR` | `data/` | Private data directory, resolved from the working directory. |
 | `GATEWAY_BIN` | `gateway/target/release/family-matrix-gateway` | Path to the Rust Gateway executable, relative to the working directory unless absolute. |
 | `CODEX_BIN` | `codex` | Optional Codex CLI executable for Codex App Server; install on the same host as the service. |
+| `FAMILY_PYTHON_BIN` | `python3` | Python interpreter for fixed PDF rendering, table statistics, and charts; use the virtual environment containing `deploy/python-requirements.txt`. |
+| `FAMILY_TIME_ZONE` | `Asia/Singapore` | Default IANA timezone for reminder and daily briefing requests. |
 | `PUBLIC_ORIGIN` | Unset | Exact allowed browser origin, such as `https://agents.example.org`, when a reverse proxy changes the request host. This does not add authentication. |
 
 For example, to use a different port and an absolute data directory:
@@ -136,7 +180,7 @@ DATA_DIR=/absolute/path/to/family-agents-data PORT=18091 npm start
 
 The application reads environment variables from its process; it does not automatically load a `.env` file. Only one application process may use a data directory at a time.
 
-For continuous operation, use your service manager to run `npm start` from the repository root, with the same service user and persistent data directory on every restart. Keep the panel behind trusted private access. The included [`deploy/family-agents.run`](deploy/family-agents.run) is an example for an existing s6/webtop installation; its paths and user are specific to that deployment.
+For continuous operation, use your service manager to run `npm start` from the repository root, with the same service user and persistent data directory on every restart. Keep the panel behind trusted private access. The included [`deploy/family-agents.run`](deploy/family-agents.run) is an example for an existing s6/webtop installation; its paths and user are specific to that deployment. It defaults to `/config/.local/opt/family-agents-python/bin/python3` for the Python environment and `Asia/Singapore` for scheduling.
 
 Changing the Matrix Server setting reinitializes Agent connections, archives previous Matrix stores, and isolates pending work from the old server. Reenter credentials if the new server requires them.
 
@@ -170,7 +214,7 @@ By default, private data lives in `data/`, which is excluded from Git. The appli
 
 | Location inside `DATA_DIR` | Contents |
 | --- | --- |
-| `application.sqlite` | People, Agent metadata, shared settings, encrypted Matrix passwords, and pending messages. |
+| `application.sqlite` | People, Agent metadata, shared settings, encrypted Matrix passwords, durable inbox/outbox, saved schedules, and schedule execution records. |
 | `credentials.key` | Key needed to decrypt stored Matrix passwords. |
 | `pi/models.json`, `pi/auth.json` | Pi provider configuration and authentication. |
 | `agents/<id>/sessions/` | Each Agent's persistent conversation. |
@@ -186,6 +230,8 @@ Normal restarts preserve Matrix devices and conversation state. Do not delete Ma
 
 Interrupted model executions are not replayed automatically; send a fresh message to continue. Completed replies awaiting delivery are retried without rerunning the model, after rechecking room membership.
 
+`ScheduleStore` commits reminder completion and its outbound message together, then retries delivery with the same Matrix transaction ID. An interrupted reminder can safely resume after restart. Interrupted briefing inference is marked as needing attention, because the application cannot assume whether that model execution completed. Schedule routing is checked again before delivery; jobs and queued messages from an earlier identity are never sent under a replacement account or homeserver.
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -196,6 +242,9 @@ Interrupted model executions are not replayed automatically; send a fresh messag
 | Agent shows Error | Open its details and check the reported error, Matrix account credentials, and provider configuration. Correct the problem before restarting it. |
 | Agent does not reply | Check that it is Running, the sender matches its owner's full Matrix ID, and the room is encrypted, invite-only, and a direct conversation containing only those two accounts, with no third-party invitations. |
 | Images fail | Select a model with image input support. The Agent's image tool can only return an image from the current incoming message. |
+| A reminder is late or not arriving | Start the Agent, check its Matrix connection and original owner-only room, then ask to list reminders. Model authentication is not needed to deliver a saved reminder. |
+| A daily briefing is rejected or paused | Select Codex Native Login with working live search. Ask to list subscriptions; cancel and recreate a paused one after fixing access. |
+| PDF export or charts fail | Install `deploy/python-requirements.txt` in the interpreter selected by `FAMILY_PYTHON_BIN`; check the input and attachment limits above. |
 | Changes are rejected as stale | Another browser changed the record. Load the latest version, review your edits, and save again. |
 
 Check service readiness with:
@@ -249,7 +298,7 @@ The optional live driver, `scripts/live-e2e.mjs`, needs dedicated test accounts 
 <details>
 <summary>s6/webtop operations for the existing installation</summary>
 
-The existing installation uses `/config/work/pith-post` inside `webtop-desktop`, backed by `/srv/webtop/config/work/pith-post` on the host. It runs as `abc`. The launcher is installed root-owned at `/srv/webtop/custom-services/family-agents`; s6 supervises Node, and Node supervises the Rust Gateway.
+The existing installation uses `/config/work/pith-post` inside `webtop-desktop`, backed by `/srv/webtop/config/work/pith-post` on the host. It runs as `abc`. The launcher is installed root-owned at `/srv/webtop/custom-services/family-agents`; s6 supervises Node, and Node supervises the Rust Gateway. Before enabling PDF exports and charts, create `/config/.local/opt/family-agents-python` as a Python virtual environment owned by the service user and install the pinned `deploy/python-requirements.txt` into it. Keep that environment outside the source checkout, preserve it across restarts, and use its interpreter through `FAMILY_PYTHON_BIN`. This adds local libraries, not another service.
 
 From the host, restart with:
 

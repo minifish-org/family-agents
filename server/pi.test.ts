@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
 import { PiService } from "./pi.js";
+import type { RuntimeTools } from "./runtime.js";
 
 const png =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -293,6 +294,7 @@ async function modelFixture() {
     const last = body.messages[body.messages.length - 1];
     const forwarding =
       last.role === "user" && content(last).includes("forward");
+    const exporting = last.role === "user" && content(last).includes("export fixture");
     const chunk: any = {
       id: `chatcmpl-${requests.length}`,
       object: "chat.completion.chunk",
@@ -301,17 +303,17 @@ async function modelFixture() {
       choices: [
         {
           index: 0,
-          delta: forwarding
+          delta: forwarding || exporting
             ? {
                 role: "assistant",
                 tool_calls: [
                   {
                     index: 0,
-                    id: "call-forward",
+                    id: exporting ? "call-export" : "call-forward",
                     type: "function",
                     function: {
-                      name: "send_image",
-                      arguments: '{"attachment_index":0}',
+                      name: exporting ? "export_file" : "send_image",
+                      arguments: exporting ? '{"format":"csv"}' : '{"attachment_index":0}',
                     },
                   },
                 ],
@@ -328,7 +330,7 @@ async function modelFixture() {
     chunk.choices[0] = {
       index: 0,
       delta: {},
-      finish_reason: forwarding ? "tool_calls" : "stop",
+      finish_reason: forwarding || exporting ? "tool_calls" : "stop",
     };
     chunk.usage = { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 };
     response.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -343,6 +345,59 @@ async function stopServer(server: Server) {
   server.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
+
+test("Pi application tools keep current owner callbacks and return files without registering execution tools", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "family-pi-application-")), fixture = await modelFixture();
+  const service = new PiService(directory);
+  const calls: string[] = [];
+  const tools = (owner: string): RuntimeTools => ({
+    definitions: [{ name: "export_file", description: "Export a fixture CSV.", inputSchema: {
+      type: "object", properties: { format: { type: "string", enum: ["csv"] } }, required: ["format"], additionalProperties: false,
+    } }],
+    execute: async (name, args, context) => {
+      assert.equal(name, "export_file"); assert.deepEqual(args, { format: "csv" }); assert.equal(context.signal.aborted, false);
+      calls.push(owner);
+      return { text: `Created ${owner}`, files: [{ name: `${owner}.csv`, mimeType: "text/csv", data: "YSxi" }] };
+    },
+  });
+  try {
+    await service.ready; await service.saveConfig(fixtureConfig(fixture.url), service.config().version);
+    const defaults = { provider: "fixture", model: "fixture-model", thinking_level: "off" };
+    const first = await service.run({ id: "a", tools: tools("first-context") }, defaults, "export fixture");
+    assert.equal(first.files?.[0].name, "first-context.csv");
+    const second = await service.run({ id: "a", tools: tools("new-context") }, defaults, "export fixture again");
+    assert.equal(second.files?.[0].name, "new-context.csv");
+    const third = await service.run({ id: "b", tools: tools("other-owner") }, defaults, "export fixture for B");
+    assert.equal(third.files?.[0].name, "other-owner.csv");
+    assert.deepEqual(calls, ["first-context", "new-context", "other-owner"]);
+    assert.deepEqual(fixture.requests.at(-1).tools.map((tool: any) => tool.function.name), ["send_image", "export_file"]);
+  } finally { await service.close(); await stopServer(fixture.server); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("stopping Pi aborts an application tool and discards late file output", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "family-pi-tool-stop-")), fixture = await modelFixture();
+  const service = new PiService(directory);
+  let entered!: () => void;
+  const executing = new Promise<void>((resolve) => { entered = resolve; });
+  const tools: RuntimeTools = {
+    definitions: [{ name: "export_file", description: "Fixture export", inputSchema: { type: "object", properties: { format: { type: "string" } } } }],
+    execute: async (_name, _args, { signal }) => {
+      entered();
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      return { text: "late", files: [{ name: "late.csv", mimeType: "text/csv", data: "YQ==" }] };
+    },
+  };
+  try {
+    await service.ready; await service.saveConfig(fixtureConfig(fixture.url), service.config().version);
+    const running = service.run({ id: "a", tools }, { provider: "fixture", model: "fixture-model", thinking_level: "off" }, "export fixture");
+    const rejected = assert.rejects(running, /abort|cancel|active/i);
+    await executing;
+    const state = (service as any).sessions.get("a");
+    await service.stopAgent("a"); await rejected;
+    assert.equal(state.toolController.signal.aborted, true);
+    assert.deepEqual(state.outputFiles, []);
+  } finally { await service.close(); await stopServer(fixture.server); rmSync(directory, { recursive: true, force: true }); }
+});
 
 test("official Pi runs retain isolated context across restart, apply prompt/model changes, and forward images with a safe tool", async () => {
   const directory = mkdtempSync(join(tmpdir(), "family-pi-session-"));

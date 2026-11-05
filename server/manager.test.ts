@@ -273,7 +273,10 @@ test("document rejections are durably acknowledged without model execution or re
       assert.ok(f.gateway.calls.some((call) => call.op === "ack_event" && call.args.event_id === rejected.event_id));
     }
     assert.equal(f.calls.runs, 0);
-    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    const notices = f.gateway.calls.filter((call) => call.op === "send_message");
+    assert.equal(notices.length, cases.length);
+    assert.ok(notices.every((call) => call.args.text.startsWith("I couldn't process this attachment:")));
+    assert.ok(notices.every((call) => !call.args.text.includes("not-base64") && !call.args.text.includes("aGVsbG8=")));
   } finally { await f.close(); }
 });
 

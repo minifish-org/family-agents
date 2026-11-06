@@ -7,6 +7,10 @@ export interface RuntimeDefaults {
 }
 export interface RuntimeAgent {
   id: string;
+  /** An application-derived Matrix thread key. An absent key selects the Agent's main session. */
+  conversationId?: string;
+  /** Earlier root text supplied as background for a new conversation's first turn. */
+  initialContext?: string;
   instructions?: string;
   tools?: RuntimeTools;
 }

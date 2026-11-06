@@ -91,6 +91,7 @@ test("due reminders do not call a model and retry delivery with the same transac
     assert.equal(f.manager.schedules.get(f.scope, schedule.id)!.state, "done");
     const first = f.gateway.sent()[0];
     assert.match(first.args.text, /Reminder 1/);
+    assert.equal(first.args.markdown, false);
     assert.match(first.args.txn_id, /^schedule-/);
     assert.equal(f.store.outbox("a").length, 1);
     const previous = { dir: f.dir, now: f.now };
@@ -104,6 +105,39 @@ test("due reminders do not call a model and retry delivery with the same transac
     assert.equal(f.store.outbox("a").length, 0);
     await f.manager.pollScheduled();
     assert.equal(f.gateway.sent().length, 1);
+  } finally { await f.close(); }
+});
+
+test("reminders and briefings created in a thread return there after restart", async () => {
+  let f = fixture();
+  let conversationId: string | undefined;
+  try {
+    f.runtime.onRun = async (agent) => {
+      conversationId = agent.conversationId;
+      const signal = new AbortController().signal;
+      await agent.tools!.execute("reminder_create", { text: "Collect the clothes", delay_seconds: 30 }, { callId: "reminder", signal });
+      await agent.tools!.execute("briefing_subscribe", { query: "Singapore weather", time: "12:01" }, { callId: "briefing", signal });
+      return { text: "Schedules saved", images: [] };
+    };
+    await f.manager.receive({
+      agent_id: "a", sender: f.scope.owner_matrix_id, room_id: f.scope.room_id, event_id: "$thread-request",
+      thread_root_id: "$thread-root", thread_root_body: "Home plans", is_direct: true,
+      members: [f.scope.owner_matrix_id, f.scope.agent_matrix_id], body: "Set a reminder and a daily briefing here.",
+    });
+    assert.match(conversationId!, /^[0-9a-f]{64}$/);
+    const previous = { dir: f.dir, now: f.now };
+    await f.close(false);
+    f = fixture(previous);
+    await f.manager.restore();
+    f.now.value += 60_000;
+    await f.manager.pollScheduled();
+    assert.equal(f.runtime.runs.length, 1);
+    assert.equal(f.runtime.runs[0].agent.conversationId, conversationId);
+    const sent = f.gateway.sent();
+    assert.equal(sent.length, 2);
+    assert.ok(sent.some(({ args }) => args.text.includes("Collect the clothes")));
+    assert.ok(sent.some(({ args }) => args.text.includes("Verified news")));
+    assert.ok(sent.every(({ args }) => args.thread_root_id === "$thread-root" && args.reply_to_event_id === "$thread-request"));
   } finally { await f.close(); }
 });
 
@@ -189,6 +223,7 @@ test("a verified briefing uses the captured owner context and cannot schedule ne
     assert.equal(f.runtime.runs.length, 1);
     assert.equal(f.gateway.sent().length, 1);
     assert.match(f.gateway.sent()[0].args.text, /Verified current news/);
+    assert.equal(f.gateway.sent()[0].args.markdown, true);
     assert.equal(f.manager.schedules.list(f.scope, "reminder").length, 0);
     assert.equal(f.manager.schedules.get(f.scope, schedule.id)!.state, "pending");
     assert.ok(f.manager.schedules.get(f.scope, schedule.id)!.next_run > f.now.value);

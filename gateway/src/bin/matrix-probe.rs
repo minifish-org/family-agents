@@ -9,11 +9,14 @@ use matrix_sdk::{
     deserialized_responses::EncryptionInfo,
     encryption::EncryptionSettings,
     ruma::{
-        OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::room::create_room,
-        events::room::message::{
-            ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-            RoomMessageEventContent,
+        events::{
+            relation::Thread,
+            room::message::{
+                ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent, Relation,
+                RoomMessageEventContent,
+            },
         },
     },
     store::RoomLoadSettings,
@@ -38,6 +41,23 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .with_context(|| format!("Missing {key}"))
+}
+
+fn message_content(
+    request: &Value,
+    mut content: RoomMessageEventContent,
+) -> Result<RoomMessageEventContent> {
+    if request.get("thread_root_id").is_some() {
+        let root: OwnedEventId = string(request, "thread_root_id")?.parse()?;
+        let latest = match request.get("reply_to_event_id") {
+            Some(_) => string(request, "reply_to_event_id")?.parse()?,
+            None => root.clone(),
+        };
+        content.relates_to = Some(Relation::Thread(Thread::plain(root, latest)));
+    } else if request.get("reply_to_event_id").is_some() {
+        bail!("A thread root is required");
+    }
+    Ok(content)
 }
 
 async fn command(
@@ -115,7 +135,10 @@ async fn command(
                     info.mimetype = Some(string(request, "mime_type")?.to_string());
                     image.info = Some(Box::new(info));
                     let response = room
-                        .send(RoomMessageEventContent::new(MessageType::Image(image)))
+                        .send(message_content(
+                            request,
+                            RoomMessageEventContent::new(MessageType::Image(image)),
+                        )?)
                         .await?;
                     Ok(
                         json!({"event_id":response.response.event_id,"encrypted":response.encryption_info.is_some()}),
@@ -123,9 +146,10 @@ async fn command(
                 }
                 _ => {
                     let response = room
-                        .send(RoomMessageEventContent::text_plain(string(
-                            request, "text",
-                        )?))
+                        .send(message_content(
+                            request,
+                            RoomMessageEventContent::text_plain(string(request, "text")?),
+                        )?)
                         .await?;
                     Ok(
                         json!({"event_id":response.response.event_id,"encrypted":response.encryption_info.is_some()}),
@@ -213,6 +237,13 @@ async fn main() -> Result<()> {
         async move {
             if !watched.lock().await.contains(room.room_id().as_str()) {return;}
             let mut message=json!({"event":"message","room_id":room.room_id(),"event_id":event.event_id,"sender":event.sender,"body":event.content.body(),"encrypted":encryption.is_some()});
+            if let Some(thread) = event.content.thread() {
+                message["thread_root_id"] = json!(thread.event_id);
+                message["is_falling_back"] = json!(thread.is_falling_back);
+                if let Some(reply) = &thread.in_reply_to {
+                    message["reply_to_event_id"] = json!(reply.event_id);
+                }
+            }
             if let MessageType::Image(image)=&event.content.msgtype {
                 match room.client().media().get_file(image,false).await {
                     Ok(Some(data)) => {

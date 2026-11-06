@@ -21,6 +21,7 @@ class FakeCodex extends EventEmitter implements CodexConnection {
   closes = 0;
   turnCounter = 0;
   threadCounter = 0;
+  readonly loadedThreads = new Set<string>();
   private loadedCredential?: string;
   constructor(dir: string) {
     super();
@@ -44,7 +45,7 @@ class FakeCodex extends EventEmitter implements CodexConnection {
     this.accessToken = token; this.providerChanges.push(token); await this.close();
   }
   setRequestHandler(handler: FakeCodex["handler"]) { this.handler = handler; }
-  async close() { this.closes++; }
+  async close() { this.closes++; this.loadedThreads.clear(); }
   async request<T = unknown>(method: string, params: any = null): Promise<T> {
     this.calls.push({ method, params });
     let result: any = {};
@@ -56,6 +57,9 @@ class FakeCodex extends EventEmitter implements CodexConnection {
       if (this.rejectResume) throw new Error("Saved conversation unavailable.");
       result = { thread: { id: params.threadId, turns: [] } };
     }
+    if (result.thread) this.loadedThreads.add(result.thread.id);
+    if (method === "thread/unsubscribe") result = { status: this.loadedThreads.delete(params.threadId) ? "unsubscribed" : "notLoaded" };
+    if (method === "thread/loaded/list") result = { data: [...this.loadedThreads] };
     if (method === "turn/start") {
       const id = `turn-${++this.turnCounter}`;
       await this.onTurn?.(params, id);
@@ -254,6 +258,70 @@ test("persistent Codex threads resume after deactivation and never silently repl
   } finally { await f.close(); }
 });
 
+test("Matrix threads keep separate Codex history while the Agent's main conversation survives", async () => {
+  const f = fixture();
+  const main = { id: "a" };
+  const budget = { ...main, conversationId: "1".repeat(64), initialContext: "Earlier root context: Budget" };
+  const travel = { ...main, conversationId: "2".repeat(64), initialContext: "Earlier root context: Travel" };
+  try {
+    f.client.onTurn = (params, id) => f.client.complete(params.threadId, id, "Answer");
+    await f.runtime.run(main, defaults, "Main topic");
+    await f.runtime.run(budget, defaults, "What about groceries?");
+    await f.runtime.run(travel, defaults, "What about hotels?");
+    assert.deepEqual([...f.client.loadedThreads].sort(), ["thread-1", "thread-3"]);
+    await f.runtime.run(budget, defaults, "Compare with last month");
+    assert.deepEqual([...f.client.loadedThreads].sort(), ["thread-1", "thread-2"]);
+
+    await f.runtime.stopAgent(main.id);
+    assert.equal(f.client.loadedThreads.size, 0);
+    await f.runtime.deactivate();
+    await f.runtime.initializeAgent(main, defaults);
+    assert.deepEqual([...f.client.loadedThreads], ["thread-1"]);
+    await f.runtime.run(travel, defaults, "Compare with flights");
+    await f.runtime.run(main, defaults, "Continue main topic");
+    const turns = f.client.calls.filter((call) => call.method === "turn/start");
+    assert.deepEqual(turns.map(({ params }) => [params.threadId, params.input[0].text]), [
+      ["thread-1", "Main topic"],
+      ["thread-2", "Earlier root context: Budget\n\nWhat about groceries?"],
+      ["thread-3", "Earlier root context: Travel\n\nWhat about hotels?"],
+      ["thread-2", "Compare with last month"],
+      ["thread-3", "Compare with flights"],
+      ["thread-1", "Continue main topic"],
+    ]);
+    const agentDir = join(f.dir, "codex", "agents", main.id);
+    assert.equal(JSON.parse(readFileSync(join(agentDir, "thread.json"), "utf8")).threadId, "thread-1");
+    for (const [conversation, nativeThread] of [[budget, "thread-2"], [travel, "thread-3"]] as const) {
+      const dir = join(agentDir, "threads", conversation.conversationId);
+      const mapping = join(dir, "thread.json");
+      assert.equal(statSync(mapping).mode & 0o777, 0o600);
+      assert.equal(JSON.parse(readFileSync(mapping, "utf8")).threadId, nativeThread);
+      assert.ok(turns.filter(({ params }) => params.threadId === nativeThread).every(({ params }) => params.cwd === join(dir, "workspace")));
+    }
+    assert.equal(f.client.threadCounter, 3);
+  } finally { await f.close(); }
+});
+
+test("stopping an Agent cancels queued Matrix threads and releases the active one before fresh work", async () => {
+  const f = fixture();
+  const active = { id: "a", conversationId: "1".repeat(64) };
+  const sibling = { ...active, conversationId: "2".repeat(64) };
+  try {
+    const interrupted = assert.rejects(f.runtime.run(active, defaults, "Active topic"), /cancelled/);
+    const cancelled = assert.rejects(f.runtime.run(sibling, defaults, "Previously queued topic"), /cancelled/);
+    await waitFor(() => f.client.turnCounter === 1);
+    assert.equal(f.client.threadCounter, 1);
+    const stopping = f.runtime.stopAgent(active.id);
+    const fresh = f.runtime.run(sibling, defaults, "Fresh topic after Stop");
+    await Promise.all([interrupted, cancelled, stopping]);
+    await waitFor(() => f.client.turnCounter === 2);
+    assert.deepEqual([...f.client.loadedThreads], ["thread-2"]);
+    f.client.complete("thread-2", "turn-2", "Fresh reply");
+    assert.equal((await fresh).text, "Fresh reply");
+    assert.deepEqual(f.client.calls.filter((call) => call.method === "turn/start")
+      .map(({ params }) => params.input[0].text), ["Active topic", "Fresh topic after Stop"]);
+  } finally { await f.close(); }
+});
+
 test("concurrent Agents isolate turns and only return attachments from the requesting turn", async () => {
   const f = fixture();
   try {
@@ -375,11 +443,33 @@ test("a rejected interrupt fails the caller and retains the turn slot until comp
     await assert.rejects(f.runtime.stopAgent("a"), /Cancellation unavailable/);
     await failed;
     await assert.rejects(f.runtime.run({ id: "a" }, defaults, "Unsafe retry"), /already has an active/);
+    await assert.rejects(f.runtime.run({ id: "a", conversationId: "1".repeat(64) }, defaults, "Unsafe sibling"), /already has an active/);
     assert.equal(f.client.turnCounter, 1, "never steer a turn whose cancellation is unconfirmed");
     f.client.complete("thread-1", "turn-1", "", "interrupted");
     f.client.onTurn = (params, id) => f.client.complete(params.threadId, id, "Recovered");
     assert.equal((await f.runtime.run({ id: "a" }, defaults, "Fresh")).text, "Recovered");
   } finally { await f.close(); }
+});
+
+test("a Stop before turn acknowledgement bounds the cancellation wait without releasing the turn", async () => {
+  const f = fixture({ interruptTimeoutMs: 5 });
+  let acknowledge!: () => void;
+  const delayed = new Promise<void>((resolve) => { acknowledge = resolve; });
+  try {
+    f.client.onTurn = () => delayed;
+    const nativeRequest = f.client.request.bind(f.client);
+    f.client.request = async <T>(method: string, params?: unknown): Promise<T> => {
+      if (method === "turn/interrupt") return {} as T;
+      return nativeRequest<T>(method, params);
+    };
+    const failed = assert.rejects(f.runtime.run({ id: "a" }, defaults, "Start"), /not confirmed cancellation/);
+    await waitFor(() => f.client.turnCounter === 1);
+    const stopping = assert.rejects(f.runtime.stopAgent("a"), /active Codex turn/);
+    acknowledge();
+    await Promise.all([failed, stopping, delay(30)]);
+    await assert.rejects(f.runtime.run({ id: "a", conversationId: "1".repeat(64) }, defaults, "Unsafe sibling"), /already has an active/);
+    f.client.complete("thread-1", "turn-1", "", "interrupted");
+  } finally { acknowledge(); await f.close(); }
 });
 
 test("turn timeouts cancel without replaying the prompt", async () => {

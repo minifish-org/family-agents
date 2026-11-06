@@ -133,6 +133,10 @@ From the Person's Matrix client, open an encrypted, invite-only direct message w
 
 The Agent replies in the same Matrix room. Conversation state is restored after normal restarts. To send images, select a global default model that supports image input.
 
+To give a topic its own conversation, open **Reply in thread** on a message in your Matrix client and send your follow-up there. The same Agent creates a separate Pi or Codex session on the first thread turn and can use the thread starter as background when it is available. Text, attachments, and progress return to that thread. Messages sent in the main timeline use the Agent's existing conversation.
+
+Thread history persists on disk and resumes on demand. Stopping the Agent or restarting the service releases live sessions and preserves their history. The Agent processes one model turn at a time across its conversations. Pi and Codex keep separate histories. A thread session is tied to its homeserver, owner, Agent account, room, and root message.
+
 Open an Agent in the web panel to edit its details or use **Start**, **Stop**, and **Restart**. Leave the password blank while editing to keep the stored password.
 
 ### Tools in your Matrix conversation
@@ -159,9 +163,9 @@ Daily briefings currently require **Codex App Server** with **Codex Native Login
 
 Schedules are created only from the owner's explicit request. The confirmation contains the saved ID and resolved local date, time, and timezone. The default timezone is `Asia/Singapore`; ask for an IANA timezone such as `Europe/London` when needed. Reminders can be from one second to 365 days ahead. Briefings run daily at `HH:mm`, follow local daylight-saving changes, and do not offer arbitrary cron expressions. Each Agent can have 20 active schedules, including paused schedules that need attention.
 
-Saved schedules survive restarts and remain bound to the original homeserver, Agent account, owner account, and room. Listing and cancellation use that same scope. Stop pauses delivery; Start resumes due work. Late reminders are marked as late. Briefings skip missed repetitions instead of sending a burst. A briefing interrupted during model execution needs attention and is never automatically run again. Reminder delivery uses the saved text without calling a model and can continue while a model connection has an error, provided the Agent is started and Matrix is connected. A long model reply does not block due reminders.
+Saved schedules survive restarts and remain bound to the original homeserver, Agent account, owner account, and room. Schedules created in a thread deliver there, and daily briefings use that thread's session. Listing and cancellation are room-wide. Stop pauses delivery and Start resumes due work. Late reminders are marked as late. Briefings skip missed repetitions instead of sending a burst. A briefing interrupted during model execution needs attention and is never automatically run again. Reminder delivery uses the saved text without calling a model and can continue while a model connection has an error, provided the Agent is started and Matrix is connected. A long model reply does not block due reminders.
 
-The Agent shows a typing indicator while processing and sends a progress notice for a slow reply. Send `cancel` or `取消` in the same owner conversation to stop the current reply. Already saved schedules remain saved; cancel a particular schedule by its ID. Failures produce a message in the owner conversation when delivery is available. Completed files and charts arrive as encrypted Matrix attachments after the reply.
+The Agent shows a typing indicator while processing and sends a progress notice for a slow reply. Send `cancel` or `取消` in the same room and thread or main timeline to stop the current reply. Cancel a saved schedule by its ID. Failures produce a message in the owner conversation when delivery is available. Completed files and charts arrive as encrypted Matrix attachments after the reply.
 
 Exports and analysis accept at most 2 MiB of structured input, 30 columns, and 5,000 rows; PDF tables are limited to 1,000 rows and PDF text to 48,000 characters. Table cells can contain up to 4,096 characters. Grouped analysis accepts at most 100 groups. Each analysis call can produce one PNG chart; bar charts display the first 100 records while statistics still use all rows, and histograms accept 5–100 bins. Each generated file or chart is limited to 8 MiB; a reply can contain at most four files, with 16 MiB total across files and images. The tools accept data and named operations, never arbitrary code, local paths, shell commands, or URLs to execute.
 
@@ -214,7 +218,7 @@ Send an encrypted Matrix attachment to ask either runtime to summarize or analyz
 
 Codex image generation is enabled for native/API-key connections when the model and account support it, and disabled for the new sign-in route. Ask for a new image or edits to images already in this conversation. Completed images return as encrypted Matrix images after the turn completes, with at most four generated images and 8 MiB total per reply. The named `family_agent` permission profile denies native local-file access; generation can use conversation images, while arbitrary local image paths are rejected. Shell, browser automation, and automatic MCP/extension discovery remain disabled.
 
-Source links in assistant text are preserved. Codex is instructed to provide source names and plain HTTPS URLs because Matrix messages are plain text and cannot resolve opaque native citation markers or reliably render Markdown links.
+Matrix displays Markdown in model replies and daily briefings as rich text in compatible clients. The gateway keeps the original text as a fallback, including for long messages that exceed the rich-text size budget. Codex uses source links with direct HTTPS URLs because Matrix cannot resolve opaque native citation markers.
 
 ## Data and backups
 

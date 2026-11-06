@@ -6,7 +6,7 @@ Every stdin/stdout line is one JSON object with `v:1`. Stdout contains only prot
 - `stop`: stop sync for one account without logging out or deleting state.
 - `reconnect`: stop and reconnect using the original start configuration, retaining persisted device/state.
 - `update_profile`: optional `display_name`, `avatar:{data,mime_type}`. An omitted avatar preserves it; `avatar:null` clears it. This also applies to `start`.
-- `send_message`: `room_id`, `text`, `txn_id` (caller-persisted Matrix transaction ID).
+- `send_message`: `room_id`, `text`, `txn_id` (caller-persisted Matrix transaction ID), optional `markdown:true`. The gateway adds sanitized Matrix HTML when it fits the encrypted message budget and keeps `text` as the plain-text fallback.
 - `send_media`: `room_id`, `data`, `mime_type`, `filename`, `txn_id`.
 - `send_file`: the same fields as `send_media`, restricted to UTF-8 CSV and PDF exports up to 8 MiB. Filenames must be safe Unicode basenames with the matching extension. Files are uploaded encrypted, the room is validated again after upload, and the persisted transaction ID is reused when delivery is retried.
 - `set_typing`: `room_id`, `typing:true|false`. Sends an ephemeral typing notice only after the same authoritative encrypted owner-DM validation; no transaction ID is needed.
@@ -15,7 +15,11 @@ Every stdin/stdout line is one JSON object with `v:1`. Stdout contains only prot
 - `ack_event`: `event_id`; acknowledges durable Node inbox storage. Unacknowledged messages replay on startup, in durable gateway arrival order.
 - `shutdown`: stops all clients and exits after acknowledging.
 
-Unsolicited events: `{v:1,event:"status",agent_id,status,error?}` and `{v:1,event:"message",agent_id,room_id,event_id,timestamp,sender,body,is_direct:true,members:[...],media?:{data,mime_type,filename},document?:{data,mime_type,filename},rejected?:string}`.
+`send_message`, `send_media`, and `send_file` accept `thread_root_id` and `reply_to_event_id` together. The caller uses the verified incoming thread root and owner message ID captured in the same room. The gateway requires distinct Matrix event IDs and sends an `m.thread` relation with an explicit reply target in the validated encrypted room. Outbound retries reuse the same relation and transaction ID.
+
+Unsolicited events: `{v:1,event:"status",agent_id,status,error?}` and `{v:1,event:"message",agent_id,room_id,event_id,timestamp,sender,body,is_direct:true,members:[...],thread_root_id?,thread_root_body?,media?:{data,mime_type,filename},document?:{data,mime_type,filename},rejected?:string}`.
+
+`thread_root_id` comes from an incoming `m.thread` relation. The gateway can also include up to 4,000 UTF-16 code units of `thread_root_body` from an original owner or Agent text message it can decrypt in the same room. Root lookup is bounded and optional. If the root text is unavailable, the gateway still emits the thread root ID.
 
 Inbound `m.file` documents must have an encrypted media source. After authoritative owner/DM checks, the SDK downloads and decrypts supported text, source-code, PDF, DOCX, and XLSX attachments; declared and downloaded sizes may not exceed 8 MiB. `body` contains the file caption when present, and `document.filename` retains the original filename. Unsupported, unencrypted, or oversized files emit a bounded `rejected` reason without document bytes, so Node durably acknowledges the event and exposes the limitation instead of silently dropping it. Download failures retain the existing sync retry behavior. Node validates documents again and extracts bounded text before invoking either runtime; it never passes a local file path to the model. Outbound images and supported PDF/CSV files use encrypted media sources.
 
@@ -25,11 +29,11 @@ The SDK SQLite state, authentication session, pending event spool and committed 
 
 ## Disposable live probe
 
-`matrix-probe PRIVATE_CONFIG_FILE` is a standalone integration test client, never part of the running application. The private configuration is `{homeserver,matrix_id,password,store_path}`. It restores its own test device and emits `{event:"ready",matrix_id,device_id}`, decrypted `{event:"message",room_id,event_id,sender,body,encrypted}` and invitations. Stdin is JSONL with an `id` and one operation:
+`matrix-probe PRIVATE_CONFIG_FILE` is a standalone integration test client, never part of the running application. The private configuration is `{homeserver,matrix_id,password,store_path}`. It restores its own test device and emits `{event:"ready",matrix_id,device_id}`, decrypted `{event:"message",room_id,event_id,sender,body,encrypted,thread_root_id?,reply_to_event_id?,is_falling_back?}` and invitations. Stdin is JSONL with an `id` and one operation:
 
 - `create_dm`: `invite:[matrix_ids]`, optional `direct` (default true); creates an encrypted invite-only room.
-- `send_message`: `room_id`, `text`.
-- `send_image`: `room_id`, base64 `data`, `mime_type`.
+- `send_message`: `room_id`, `text`, optional `thread_root_id` and `reply_to_event_id`. The reply target defaults to the root when opening a thread.
+- `send_image`: `room_id`, base64 `data`, `mime_type`, and the same optional thread fields.
 - `invite`: `room_id`, `matrix_id`.
 - `join`, `leave`, `members`: `room_id`.
 - `watch`: `room_id`; permits messages only from this test room to be emitted. Rooms created or joined through this probe are watched automatically. Historical messages from other rooms are suppressed.

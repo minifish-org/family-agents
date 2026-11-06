@@ -374,7 +374,7 @@ test("Pi application tools keep current owner callbacks and return files without
   } finally { await service.close(); await stopServer(fixture.server); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("stopping Pi aborts an application tool and discards late file output", async () => {
+test("stopping Pi aborts a threaded application tool and discards late file output", async () => {
   const directory = mkdtempSync(join(tmpdir(), "family-pi-tool-stop-")), fixture = await modelFixture();
   const service = new PiService(directory);
   let entered!: () => void;
@@ -389,14 +389,59 @@ test("stopping Pi aborts an application tool and discards late file output", asy
   };
   try {
     await service.ready; await service.saveConfig(fixtureConfig(fixture.url), service.config().version);
-    const running = service.run({ id: "a", tools }, { provider: "fixture", model: "fixture-model", thinking_level: "off" }, "export fixture");
+    const defaults = { provider: "fixture", model: "fixture-model", thinking_level: "off" };
+    await service.initializeAgent({ id: "a" }, defaults);
+    const running = service.run({ id: "a", conversationId: "a".repeat(64), tools }, defaults, "export fixture");
     const rejected = assert.rejects(running, /abort|cancel|active/i);
     await executing;
-    const state = (service as any).sessions.get("a");
+    const state = (service as any).activeThreads.get("a");
     await service.stopAgent("a"); await rejected;
     assert.equal(state.toolController.signal.aborted, true);
     assert.deepEqual(state.outputFiles, []);
+    assert.equal((service as any).sessions.size, 0);
+    assert.equal((service as any).activeThreads.size, 0);
   } finally { await service.close(); await stopServer(fixture.server); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("Pi resumes a thread after releasing it and preserves separate thread and main histories across restart", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "family-pi-thread-session-"));
+  const fixture = await modelFixture();
+  let service = new PiService(directory);
+  const defaults = { provider: "fixture", model: "fixture-model", thinking_level: "off" };
+  const main = { id: "agent" };
+  const threadA = { ...main, conversationId: "a".repeat(64), initialContext: "Earlier root: budget" };
+  const threadB = { ...main, conversationId: "b".repeat(64), initialContext: "Earlier root: holiday" };
+  const run = async (agent: typeof main, message: string, count: number) => {
+    const reply = await service.run(agent, defaults, message);
+    assert.equal(reply.text, `Reply with ${count} user messages.`);
+    assert.equal((service as any).activeThreads.size, 0);
+    return fixture.requests.at(-1).messages.filter((item: any) => item.role === "user");
+  };
+  try {
+    await service.ready;
+    await service.saveConfig(fixtureConfig(fixture.url), service.config().version);
+    await service.initializeAgent(threadA, defaults);
+    assert.equal(existsSync(join(directory, "agents", "agent", "threads")), false);
+    await run(main, "Main before", 1);
+    assert.equal(JSON.stringify(await run(threadA, "First budget", 1)).includes("Earlier root: budget"), true);
+    assert.equal(JSON.stringify(await run(threadB, "First holiday", 1)).includes("First budget"), false);
+    const budget = JSON.stringify(await run(threadA, "Second budget", 2));
+    assert.equal(budget.includes("First holiday"), false);
+    assert.equal(budget.includes("Main before"), false);
+    assert.equal(budget.match(/Earlier root: budget/g)?.length, 1);
+    await service.stopAgent(main.id);
+    await run(main, "Main after stop", 2);
+    await service.close();
+    service = new PiService(directory);
+    assert.equal(JSON.stringify(await run(main, "Main after restart", 3)).includes("Earlier root"), false);
+    await run(threadA, "Budget after restart", 3);
+    await run(threadB, "Holiday after restart", 2);
+    await assert.rejects(service.run({ ...main, conversationId: "../sessions" }, defaults, "Invalid thread"), /invalid conversation/i);
+  } finally {
+    await service.close();
+    await stopServer(fixture.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("official Pi runs retain isolated context across restart, apply prompt/model changes, and forward images with a safe tool", async () => {

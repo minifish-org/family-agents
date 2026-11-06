@@ -5,10 +5,11 @@ use matrix_sdk::{
     Client, Room, RoomMemberships, RoomState,
     authentication::matrix::MatrixSession,
     config::{RequestConfig, SyncSettings, SyncToken},
-    deserialized_responses::EncryptionInfo,
+    deserialized_responses::{EncryptionInfo, TimelineEventKind},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
+    event_handler::RawEvent,
     ruma::{
-        OwnedRoomId, OwnedTransactionId, OwnedUserId,
+        EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId,
         api::client::{
             config::{get_global_account_data, set_global_account_data},
             keys::get_keys,
@@ -17,13 +18,17 @@ use matrix_sdk::{
             state::get_state_event_for_key,
         },
         events::{
-            GlobalAccountDataEventType, StateEventType,
+            AnyMessageLikeEvent, AnyTimelineEvent, GlobalAccountDataEventType, MessageLikeEvent,
+            StateEventType,
+            relation::Thread,
             room::{
                 ImageInfo, MediaSource,
                 member::StrippedRoomMemberEvent,
                 message::{
                     FileInfo, FileMessageEventContent, ImageMessageEventContent, MessageType,
-                    OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+                    OriginalRoomMessageEvent, OriginalSyncRoomMessageEvent, Relation,
+                    RoomMessageEventContent, TextMessageEventContent,
+                    sanitize::remove_plain_reply_fallback,
                 },
             },
         },
@@ -48,10 +53,14 @@ use tokio::{
 };
 
 use matrix_sdk_crypto::{types::SecretsBundle, vodozemac::Ed25519SecretKey};
+use ruma::html::{Html, SanitizerConfig};
 
 static DIRECT_UPDATES: Mutex<()> = Mutex::const_new(());
 
 const MAX_MEDIA: usize = 8 * 1024 * 1024;
+// Leave room in Matrix's 64 KiB event limit for encryption, base64 and event metadata.
+const MAX_FORMATTED_MESSAGE_BYTES: usize = 45 * 1024;
+const MAX_THREAD_ROOT_BODY_UNITS: usize = 4000;
 type Output = mpsc::Sender<Value>;
 type Accounts = Arc<Mutex<HashMap<String, Arc<Mutex<Account>>>>>;
 
@@ -753,6 +762,81 @@ async fn verify_identity(client: &Client, config: &Start) -> Result<()> {
     Ok(())
 }
 
+async fn fetch_thread_root(room: &Room, event_id: &EventId) -> Option<OriginalRoomMessageEvent> {
+    let event = tokio::time::timeout(
+        Duration::from_secs(5),
+        room.load_or_fetch_event(event_id, Some(RequestConfig::new().disable_retry())),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let TimelineEventKind::Decrypted(decrypted) = event.kind else {
+        return None;
+    };
+    let AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
+        MessageLikeEvent::Original(message),
+    )) = decrypted.event.deserialize().ok()?
+    else {
+        return None;
+    };
+    (message.event_id == event_id && message.room_id == room.room_id()).then_some(message)
+}
+
+fn thread_root_body<'a>(
+    event: &'a OriginalRoomMessageEvent,
+    owner_id: &str,
+    agent_id: &str,
+) -> Option<&'a str> {
+    if (event.sender != owner_id && event.sender != agent_id)
+        || !matches!(event.content.relates_to, None | Some(Relation::Reply(_)))
+        || !matches!(
+            event.content.msgtype,
+            MessageType::Text(_) | MessageType::Notice(_)
+        )
+    {
+        return None;
+    }
+    let mut body = event.content.body();
+    if matches!(event.content.relates_to, Some(Relation::Reply(_))) {
+        body = remove_plain_reply_fallback(body);
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let mut units = 0;
+    for (index, character) in body.char_indices() {
+        units += character.len_utf16();
+        if units > MAX_THREAD_ROOT_BODY_UNITS {
+            return Some(&body[..index]);
+        }
+    }
+    Some(body)
+}
+
+fn valid_thread_event_id(id: &str) -> bool {
+    (2..=255).contains(&id.len()) && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn is_new_message(event: &OriginalSyncRoomMessageEvent, raw: &str) -> bool {
+    match &event.content.relates_to {
+        None => true,
+        Some(Relation::Replacement(_)) => false,
+        Some(Relation::Thread(thread)) => {
+            thread.event_id != event.event_id
+                && valid_thread_event_id(thread.event_id.as_str())
+                && valid_thread_event_id(event.event_id.as_str())
+        }
+        // Ruma may deserialize a malformed thread as a generic relation or ordinary reply.
+        Some(_) => serde_json::from_str::<Value>(raw).is_ok_and(|value| {
+            !matches!(
+                value["content"]["m.relates_to"]["rel_type"].as_str(),
+                Some("m.thread" | "io.element.thread" | "m.replace")
+            )
+        }),
+    }
+}
+
 async fn start(account: &mut Account, config: Start, out: Output) -> Result<Value> {
     if account.client.is_some()
         && account
@@ -793,14 +877,14 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
     let message_config = config.clone();
     let message_out = out.clone();
     let handler_failure = failure.clone();
-    client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
+    client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>, raw: RawEvent| {
         let config = message_config.clone();
         let out = message_out.clone();
         let pending = pending.clone();
         let failure = handler_failure.clone();
         async move {
             // A plain m.room.message injected into an encrypted room is never accepted.
-            if event.sender.as_str() != config.owner_id || encryption.is_none() { return; }
+            if event.sender.as_str() != config.owner_id || encryption.is_none() || !is_new_message(&event, raw.get()) { return; }
             let process = async {
                 let members = match validate_room(&room.client(), &room, &config, true).await {
                     Ok(members) => members,
@@ -834,6 +918,14 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
                         }
                     },
                     _ => return Ok(()),
+                }
+                if let Some(thread) = event.content.thread() {
+                    message["thread_root_id"] = json!(thread.event_id);
+                    if let Some(root) = fetch_thread_root(&room, &thread.event_id).await
+                        && let Some(body) = thread_root_body(&root, &config.owner_id, &config.matrix_id)
+                    {
+                        message["thread_root_body"] = json!(body);
+                    }
                 }
                 let mut pending = pending.lock().await;
                 let key = event.event_id.to_string();
@@ -964,6 +1056,67 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("Missing string field: {key}"))
 }
 
+fn requested_thread(request: &Value) -> Result<Option<Thread>> {
+    if request.get("thread_root_id").is_none() && request.get("reply_to_event_id").is_none() {
+        return Ok(None);
+    }
+    let parse = |field| -> Result<OwnedEventId> {
+        let id = string(request, field)?;
+        if !valid_thread_event_id(id) {
+            bail!("Invalid Matrix event ID in {field}");
+        }
+        id.parse()
+            .with_context(|| format!("Invalid Matrix event ID in {field}"))
+    };
+    let root = parse("thread_root_id")?;
+    let source = parse("reply_to_event_id")?;
+    if root == source {
+        bail!("A threaded reply must target a message in the thread");
+    }
+    Ok(Some(Thread::reply(root, source)))
+}
+
+fn sanitize_matrix_html(input: &str) -> String {
+    let html = Html::parse(input);
+    html.sanitize_with(&SanitizerConfig::strict().remove_reply_fallback());
+
+    // Ruma 0.9 can skip URL validation when another attribute sorts before the URL.
+    let mut nodes: Vec<_> = html.children().collect();
+    while let Some(node) = nodes.pop() {
+        nodes.extend(node.children());
+        if let Some(element) = node.as_element() {
+            element
+                .attrs
+                .borrow_mut()
+                .retain(|attribute| match attribute.name.local.as_ref() {
+                    "href" => attribute.value.split_once(':').is_some_and(|(scheme, _)| {
+                        matches!(scheme, "http" | "https" | "ftp" | "mailto" | "magnet")
+                    }),
+                    "src" => attribute.value.starts_with("mxc://"),
+                    _ => true,
+                });
+        }
+    }
+    html.to_string()
+}
+
+fn markdown_message(text: &str) -> Result<RoomMessageEventContent> {
+    if text.len() > MAX_FORMATTED_MESSAGE_BYTES {
+        return Ok(RoomMessageEventContent::text_plain(text));
+    }
+
+    let mut message = TextMessageEventContent::markdown(text);
+    if let Some(formatted) = &mut message.formatted {
+        formatted.body = sanitize_matrix_html(&formatted.body);
+        if formatted.body.trim().is_empty()
+            || serde_json::to_vec(&message)?.len() > MAX_FORMATTED_MESSAGE_BYTES
+        {
+            message.formatted = None;
+        }
+    }
+    Ok(RoomMessageEventContent::new(MessageType::Text(message)))
+}
+
 async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<Value> {
     if request["v"] != 1 {
         bail!("Unsupported protocol version");
@@ -1071,13 +1224,14 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                 bail!("A stable transaction ID is required");
             }
             let txn: OwnedTransactionId = txn.into();
-            let event_id = if op == "send_message" {
+            let thread = requested_thread(request)?;
+            let mut content = if op == "send_message" {
                 let text = string(request, "text")?;
-                room.send(RoomMessageEventContent::text_plain(text))
-                    .with_transaction_id(txn)
-                    .await?
-                    .response
-                    .event_id
+                if request["markdown"].as_bool() == Some(true) {
+                    markdown_message(text)?
+                } else {
+                    RoomMessageEventContent::text_plain(text)
+                }
             } else {
                 let media: Media = serde_json::from_value(request.clone())?;
                 let (bytes, mime) = if op == "send_file" {
@@ -1090,7 +1244,7 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                 let file = client.upload_encrypted_file(&mut reader).await?;
                 // Upload precedes a fresh membership check; uploaded bytes disclose no plaintext.
                 validate_room(client, &room, config, false).await?;
-                let content = if op == "send_file" {
+                if op == "send_file" {
                     let mut info = FileInfo::new();
                     info.mimetype = Some(mime.to_string());
                     info.size = Some((length as u32).into());
@@ -1104,13 +1258,15 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                     let content = ImageMessageEventContent::encrypted(media.filename, file)
                         .info(Some(Box::new(info)));
                     RoomMessageEventContent::new(MessageType::Image(content))
-                };
-                room.send(content)
-                    .with_transaction_id(txn)
-                    .await?
-                    .response
-                    .event_id
+                }
             };
+            content.relates_to = thread.map(Relation::Thread);
+            let event_id = room
+                .send(content)
+                .with_transaction_id(txn)
+                .await?
+                .response
+                .event_id;
             Ok(json!({"event_id":event_id}))
         }
         _ => bail!("Unknown operation: {op}"),
@@ -1196,6 +1352,126 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn threaded_sends_preserve_root_and_owner_reply_target() {
+        let request = json!({"thread_root_id":"$root","reply_to_event_id":"$owner-message"});
+        let mut message = markdown_message("**In the thread**").unwrap();
+        message.relates_to = requested_thread(&request).unwrap().map(Relation::Thread);
+        let message = serde_json::to_value(message).unwrap();
+        assert_eq!(message["formatted_body"], "<strong>In the thread</strong>");
+        assert_eq!(
+            message["m.relates_to"],
+            json!({
+                "rel_type":"m.thread", "event_id":"$root", "m.in_reply_to":{"event_id":"$owner-message"},
+            })
+        );
+        assert!(requested_thread(&json!({})).unwrap().is_none());
+        for invalid in [
+            json!({"thread_root_id":"$root"}),
+            json!({"reply_to_event_id":"$owner-message"}),
+            json!({"thread_root_id":null,"reply_to_event_id":"$owner-message"}),
+            json!({"thread_root_id":"$","reply_to_event_id":"$owner-message"}),
+            json!({"thread_root_id":"$root","reply_to_event_id":"not-an-event"}),
+            json!({"thread_root_id":"$root","reply_to_event_id":"$root"}),
+        ] {
+            assert!(requested_thread(&invalid).is_err(), "Accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn thread_seed_uses_participant_root_text_with_a_utf16_limit() {
+        let body = format!("{}🧵", "a".repeat(3999));
+        let mut root: OriginalRoomMessageEvent = serde_json::from_value(json!({
+            "type":"m.room.message", "event_id":"$root", "room_id":"!owner:example.org",
+            "sender":"@owner:example.org", "origin_server_ts":123,
+            "content":{"msgtype":"m.text","body":body},
+        }))
+        .unwrap();
+        let owner = "@owner:example.org";
+        let agent = "@bot:example.org";
+        assert_eq!(thread_root_body(&root, owner, agent), Some(&body[..3999]));
+        root.sender = "@other:example.org".parse().unwrap();
+        assert_eq!(thread_root_body(&root, owner, agent), None);
+        root.sender = agent.parse().unwrap();
+        root.content = serde_json::from_value(json!({
+            "msgtype":"m.text", "body":"> <@owner:example.org> Old quoted reply\n\nThe root text",
+            "m.relates_to":{"m.in_reply_to":{"event_id":"$original"}},
+        }))
+        .unwrap();
+        assert_eq!(thread_root_body(&root, owner, agent), Some("The root text"));
+        root.content.relates_to = Some(Relation::Thread(Thread::without_fallback(
+            "$ancestor".parse().unwrap(),
+        )));
+        assert_eq!(thread_root_body(&root, owner, agent), None);
+    }
+
+    #[test]
+    fn replacements_and_malformed_threads_do_not_enter_the_main_conversation() {
+        let event = |content| {
+            let raw = json!({
+                "type":"m.room.message", "event_id":"$event", "sender":"@owner:example.org",
+                "origin_server_ts":123, "content":content,
+            })
+            .to_string();
+            let event = serde_json::from_str::<OriginalSyncRoomMessageEvent>(&raw).unwrap();
+            is_new_message(&event, &raw)
+        };
+        assert!(event(json!({
+            "msgtype":"m.text", "body":"thread follow-up",
+            "m.relates_to":{"rel_type":"m.thread","event_id":"$root"},
+        })));
+        assert!(!event(json!({
+            "msgtype":"m.text", "body":"* edited follow-up",
+            "m.relates_to":{"rel_type":"m.replace","event_id":"$original"},
+            "m.new_content":{"msgtype":"m.text","body":"edited follow-up"},
+        })));
+        assert!(!event(json!({
+            "msgtype":"m.text", "body":"invalid follow-up",
+            "m.relates_to":{"rel_type":"m.thread","m.in_reply_to":{"event_id":"$original"}},
+        })));
+        for rel_type in ["m.thread", "m.replace"] {
+            assert!(!event(json!({
+                "msgtype":"m.text", "body":"invalid relation without a target",
+                "m.relates_to":{"rel_type":rel_type},
+            })));
+        }
+        assert!(event(json!({
+            "msgtype":"m.text", "body":"main-conversation reply",
+            "m.relates_to":{"m.in_reply_to":{"event_id":"$original"}},
+        })));
+    }
+
+    #[test]
+    fn markdown_uses_sanitized_matrix_html_with_original_text_as_fallback() {
+        let text = "# 标题\n\n- **Bold** and [source](https://example.org)\n\n```rust\nlet x = 1;\n```\n\n<a href=\"javascript:alert(1)\" onclick=\"alert(1)\">Unsafe</a>\n\n<a class=\"link\" href=\"javascript:alert(1)\">Unsafe with class</a>\n\n![External](https://example.org/image.png)";
+        let message = serde_json::to_value(markdown_message(text).unwrap()).unwrap();
+        assert_eq!(message["msgtype"], "m.text");
+        assert_eq!(message["body"], text);
+        assert_eq!(message["format"], "org.matrix.custom.html");
+        let html = message["formatted_body"].as_str().unwrap();
+        for expected in [
+            "<h1>标题</h1>",
+            "<li><strong>Bold</strong>",
+            "<a href=\"https://example.org\">source</a>",
+            "<pre><code class=\"language-rust\">let x = 1;",
+            "Unsafe",
+        ] {
+            assert!(html.contains(expected), "Missing {expected} in {html}");
+        }
+        for rejected in ["javascript:", "onclick=", "https://example.org/image.png"] {
+            assert!(!html.contains(rejected), "Found {rejected} in {html}");
+        }
+    }
+
+    #[test]
+    fn plain_and_oversized_markdown_messages_keep_the_original_text() {
+        let long_markdown = format!("**{}**", "字".repeat(8_000));
+        for text in ["Plain text", "<!-- hidden -->", &long_markdown] {
+            let message = serde_json::to_value(markdown_message(text).unwrap()).unwrap();
+            assert_eq!(message, json!({"msgtype": "m.text", "body": text}));
+        }
+    }
 
     #[test]
     fn restored_identity_requires_matching_public_keys() {

@@ -28,6 +28,7 @@ export type Schedule = ScheduleScope & {
 };
 export type ScheduleClaim = {
   schedule: Schedule;
+  source_event_id: string;
   run_id: string;
   txn_id: string;
   occurrence_at: number;
@@ -293,7 +294,8 @@ export class ScheduleStore {
       this.db.prepare("INSERT INTO schedule_runs VALUES(?,?,?,?,'running',NULL,?,?) ON CONFLICT(schedule_id,occurrence_at) DO UPDATE SET id=excluded.id,txn_id=excluded.txn_id,state='running',error=NULL,updated=excluded.updated")
         .run(run, schedule.id, schedule.next_run, txn, now, now);
       this.db.prepare("UPDATE schedules SET state='running',active_run=?,last_error=NULL,updated=? WHERE id=? AND state='pending'").run(run, now, schedule.id);
-      return { schedule: this.get(scope, id)!, run_id: run, txn_id: txn, occurrence_at: schedule.next_run };
+      const source = this.db.prepare("SELECT source_event_id FROM schedules WHERE id=?").get(id)!;
+      return { schedule: this.get(scope, id)!, source_event_id: source.source_event_id as string, run_id: run, txn_id: txn, occurrence_at: schedule.next_run };
     });
   }
 

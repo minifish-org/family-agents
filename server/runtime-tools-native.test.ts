@@ -118,6 +118,23 @@ test("native application tools upgrade existing history, rotate run capabilities
     assert.equal((await fetch(cancelledConfig.url, { method: "POST", headers: cancelledConfig.http_headers, body: "{}" })).status, 401);
     const withoutTools = await runtime.run({ id: "a" }, defaults, "NO APPLICATION TOOLS");
     assert.equal(withoutTools.files, undefined);
+
+    const budget = { id: "a", conversationId: "1".repeat(64), initialContext: "BUDGET ROOT" };
+    const travel = { id: "a", conversationId: "2".repeat(64), initialContext: "TRAVEL ROOT" };
+    await runtime.run(budget, defaults, "BUDGET FIRST QUESTION");
+    await runtime.run(travel, defaults, "TRAVEL FIRST QUESTION");
+    await runtime.deactivate();
+    await runtime.run(budget, defaults, "BUDGET FOLLOWUP AFTER RESTART");
+    await runtime.run({ id: "a" }, defaults, "MAIN FOLLOWUP AFTER RESTART");
+    const budgetInput = JSON.stringify(requests.find((body) => JSON.stringify(body.input).includes("BUDGET FOLLOWUP AFTER RESTART"))?.input);
+    assert.match(budgetInput, /BUDGET ROOT[\s\S]*BUDGET FIRST QUESTION/);
+    assert.doesNotMatch(budgetInput, /TRAVEL ROOT|TRAVEL FIRST QUESTION|ORIGINAL HISTORY PROOF/);
+    const travelInput = JSON.stringify(requests.find((body) => JSON.stringify(body.input).includes("TRAVEL FIRST QUESTION"))?.input);
+    assert.match(travelInput, /TRAVEL ROOT/);
+    assert.doesNotMatch(travelInput, /BUDGET ROOT|ORIGINAL HISTORY PROOF/);
+    const mainInput = JSON.stringify(requests.find((body) => JSON.stringify(body.input).includes("MAIN FOLLOWUP AFTER RESTART"))?.input);
+    assert.match(mainInput, /ORIGINAL HISTORY PROOF/);
+    assert.doesNotMatch(mainInput, /BUDGET ROOT|TRAVEL ROOT/);
     assert.ifError(fixtureError);
   } finally {
     await runtime.close(); server.closeAllConnections();

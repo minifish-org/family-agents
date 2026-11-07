@@ -537,6 +537,15 @@ fn unauthorized(error: &str) -> bool {
         || error.contains("M_FORBIDDEN")
 }
 
+fn sync_retry_delay(error: &str, failures: &mut u32) -> Option<Duration> {
+    *failures = failures.saturating_add(1);
+    if unauthorized(error) {
+        return None;
+    }
+    // Temporary homeserver outages must not permanently stop this Agent's sync task.
+    Some(Duration::from_secs((1u64 << (*failures).min(5)).min(30)))
+}
+
 fn recoverable_store(error: &str) -> bool {
     let message = error.to_lowercase();
     message.contains("database disk image is malformed")
@@ -969,21 +978,25 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let mut failures = 0;
+        let mut sync_failures = 0u32;
+        let mut inbound_failures = 0u32;
         loop {
             let settings = SyncSettings::new()
                 .token(SyncToken::from_optional_token(cursor.clone()))
                 .timeout(Duration::from_secs(20));
             match task_client.sync_once(settings).await {
                 Ok(response) => {
+                    sync_failures = 0;
                     if failure.swap(false, Ordering::SeqCst) {
-                        failures += 1;
-                        if failures >= 8 {
+                        inbound_failures = inbound_failures.saturating_add(1);
+                        if inbound_failures >= 8 {
                             emit_status(&task_out, &task_config.agent_id, "error", Some("Inbound delivery failed repeatedly; reconnect after correcting the reported error".to_string()));
                             break;
                         }
-                        tokio::time::sleep(Duration::from_secs((1u64 << failures.min(5)).min(30)))
-                            .await;
+                        tokio::time::sleep(Duration::from_secs(
+                            (1u64 << inbound_failures.min(5)).min(30),
+                        ))
+                        .await;
                         continue;
                     }
                     for room in task_client.joined_rooms() {
@@ -1021,13 +1034,12 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
                         break;
                     }
                     cursor = Some(response.next_batch);
-                    failures = 0;
+                    inbound_failures = 0;
                     emit_status(&task_out, &task_config.agent_id, "running", None);
                 }
                 Err(error) => {
-                    failures += 1;
                     let text = error.to_string();
-                    if unauthorized(&text) || failures >= 8 {
+                    let Some(delay) = sync_retry_delay(&text, &mut sync_failures) else {
                         emit_status(
                             &task_out,
                             &task_config.agent_id,
@@ -1035,10 +1047,9 @@ async fn start(account: &mut Account, config: Start, out: Output) -> Result<Valu
                             Some(format!("Matrix synchronization failed: {text}")),
                         );
                         break;
-                    }
+                    };
                     emit_status(&task_out, &task_config.agent_id, "reconnecting", Some(text));
-                    tokio::time::sleep(Duration::from_secs((1u64 << failures.min(5)).min(30)))
-                        .await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -1731,6 +1742,46 @@ mod tests {
         assert!(recoverable_store("database disk image is malformed"));
         assert!(!recoverable_store("M_FORBIDDEN: invalid password"));
         assert!(!recoverable_store("Network connection timed out"));
+    }
+    #[test]
+    fn sync_keeps_retrying_temporary_outages_with_bounded_backoff() {
+        let mut failures = 0;
+        for attempt in 1..=40 {
+            let error = match attempt % 3 {
+                0 => "[503 / M_UNKNOWN] Homeserver unavailable",
+                1 => "error sending request: connection timed out",
+                _ => "[429 / M_LIMIT_EXCEEDED] Too many requests",
+            };
+            let delay = sync_retry_delay(error, &mut failures)
+                .expect("A temporary homeserver outage must not stop the Agent");
+            assert!(delay <= Duration::from_secs(30));
+            if attempt > 8 {
+                assert_eq!(delay, Duration::from_secs(30));
+            }
+        }
+        // A successful sync resets the same counter before the next outage.
+        failures = 0;
+        assert_eq!(
+            sync_retry_delay("connection refused", &mut failures),
+            Some(Duration::from_secs(2))
+        );
+        failures = u32::MAX;
+        assert_eq!(
+            sync_retry_delay("connection refused", &mut failures),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(failures, u32::MAX);
+    }
+    #[test]
+    fn sync_stops_for_revoked_or_missing_authorization() {
+        for error in [
+            "[401 / M_UNKNOWN_TOKEN] Token revoked",
+            "[401 / M_MISSING_TOKEN] Missing access token",
+            "[403 / M_FORBIDDEN] Access denied",
+        ] {
+            let mut failures = 0;
+            assert_eq!(sync_retry_delay(error, &mut failures), None);
+        }
     }
     #[tokio::test]
     async fn global_readiness_and_protocol_version() {

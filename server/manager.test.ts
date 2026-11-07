@@ -280,6 +280,70 @@ test("document rejections are durably acknowledged without model execution or re
   } finally { await f.close(); }
 });
 
+test("Matrix reconnection restores processing after a transient transport failure", async () => {
+  const f = fixture();
+  f.pi.sanitizeError = (error: unknown) => String(error).replaceAll("fixture-private-key", "[redacted]");
+  try {
+    f.gateway.emit("event", {
+      event: "status", agent_id: "a", status: "reconnecting",
+      error: "Temporary Matrix connection failure: fixture-private-key",
+    });
+    assert.equal(f.store.agent("a").status, "Stopped");
+    assert.ok(f.store.agent("a").error);
+    assert.ok(!f.store.agent("a").error?.includes("fixture-private-key"));
+    await f.manager.receive(f.event);
+    assert.equal(f.calls.runs, 0);
+    assert.equal(f.store.db.prepare("SELECT state FROM inbox WHERE event_id='$one'").get()!.state, "queued");
+    f.gateway.emit("event", { event: "status", agent_id: "a", status: "reconnecting", error: "Matrix is still reconnecting." });
+    assert.equal(f.store.agent("a").error, "Matrix is still reconnecting.");
+
+    f.gateway.emit("event", { event: "status", agent_id: "a", status: "running" });
+    assert.equal(f.store.agent("a").status, "Running");
+    assert.equal(f.store.agent("a").error, null);
+    await f.manager.serial.run("a", async () => {});
+    assert.equal(f.calls.runs, 1);
+    assert.equal(f.store.db.prepare("SELECT state FROM inbox WHERE event_id='$one'").get()!.state, "done");
+    assert.equal(f.gateway.calls.filter((call) => call.op === "start").length, 0);
+  } finally { await f.close(); }
+});
+
+test("Matrix status failures retain useful details while redacting provider secrets", async () => {
+  const f = fixture();
+  f.pi.sanitizeError = (error: unknown) => String(error).replaceAll("fixture-private-key", "[redacted]");
+  try {
+    f.gateway.emit("event", {
+      event: "status", agent_id: "a", status: "error",
+      error: "Matrix synchronization failed: fixture-private-key",
+    });
+    assert.equal(f.store.agent("a").status, "Error");
+    assert.equal(f.store.agent("a").error, "Matrix synchronization failed: [redacted]");
+  } finally { await f.close(); }
+});
+
+test("Matrix reconnection preserves unrelated Agent errors before and during a disconnect", async () => {
+  for (const [status, error] of [
+    ["Error", "Saved model session cannot be resumed."],
+    ["Error", "Reply delivery pending: Temporary Matrix send failure."],
+    ["Running", "A previous reply was interrupted. Send a new message to continue."],
+  ]) {
+    const f = fixture();
+    try {
+      for (const duringReconnect of [false, true]) {
+        if (duringReconnect) {
+          f.store.status("a", "Running");
+          f.gateway.emit("event", { event: "status", agent_id: "a", status: "reconnecting", error: "Temporary Matrix connection failure." });
+        }
+        f.store.status("a", status, error);
+        f.gateway.emit("event", { event: "status", agent_id: "a", status: "reconnecting", error: "Temporary Matrix connection failure." });
+        f.gateway.emit("event", { event: "status", agent_id: "a", status: "Running" });
+        assert.equal(f.store.agent("a").status, status);
+        assert.equal(f.store.agent("a").error, error);
+      }
+      assert.equal(f.calls.runs, 0);
+    } finally { await f.close(); }
+  }
+});
+
 test("Matrix running notifications preserve Agent errors until verified runtime recovery", async () => {
   const f = fixture();
   try {

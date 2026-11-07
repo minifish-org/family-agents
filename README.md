@@ -252,6 +252,7 @@ Interrupted model executions are not replayed automatically; send a fresh messag
 | Matrix Server cannot be saved | Use the homeserver's HTTP(S) base URL, not its web client URL. Check that the application can reach `/_matrix/client/versions` on that server. |
 | No models are available | Configure a provider first, return to Settings, and select an available model. An unavailable saved model is kept visible as an explanatory message. |
 | Agent shows Error | Open its details and check the reported error, Matrix account credentials, and provider configuration. Correct the problem before restarting it. |
+| Agent temporarily stops during a Matrix outage | It reconnects automatically with a capped delay and resumes queued messages after a successful sync. Authentication or local storage errors still require attention; connection recovery does not clear unrelated model errors. |
 | Agent does not reply | Check that it is Running, the sender matches its owner's full Matrix ID, and the room is encrypted, invite-only, and a direct conversation containing only those two accounts, with no third-party invitations. |
 | Images fail | Select a model with image input support. The Agent's image tool can only return an image from the current incoming message. |
 | A reminder is late or not arriving | Start the Agent, check its Matrix connection and original owner-only room, then ask to list reminders. Model authentication is not needed to deliver a saved reminder. |

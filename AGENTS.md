@@ -46,6 +46,8 @@ Claim due work with durable leases and stable occurrence transaction IDs. Comple
 
 Show Matrix typing while processing and a bounded progress notice for slow replies. An owner cancellation in the active room aborts the current reply and tool work without cancelling previously saved schedules. Report actionable failures in the verified owner room. Preserve unrelated runtime errors when a saved reminder or an outbox message delivers successfully; only explicit runtime recovery or a successful fresh runtime operation clears them.
 
+Transient Matrix sync failures must keep reconnecting with capped backoff until stopped, retaining the existing device, cursor, and durable inbox. Authentication rejection and durable-storage failures remain terminal. A successful sync clears only its own transport error and restores processing; it must preserve model, session, interrupted-reply, and delivery errors. Retain redacted diagnostic text from Gateway status events.
+
 ## Build, tests, deployment
 
 Requirements: Node.js >=24, npm, Rust >=1.96, a C/C++ compiler and pkg-config. Run `npm ci`, `npm run check`, `npm test`, `npm run build`, and `cargo test --manifest-path gateway/Cargo.toml`. Build the Gateway with `cargo build --locked --release --bins --manifest-path gateway/Cargo.toml`; run `npm start`. `HOST` defaults to loopback, `PORT` to 18090; `GATEWAY_BIN` overrides the child executable. `/api/health` reports core readiness and Agent status.

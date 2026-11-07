@@ -64,6 +64,7 @@ export class Manager {
   transitioning = false;
   private transitionDone: Promise<void> = Promise.resolve();
   private matrixConnected = new Set<string>();
+  private matrixReconnectErrors = new Map<string, { error: string | null }>();
   constructor(
     public store: Store,
     public pi: PiService,
@@ -95,22 +96,36 @@ export class Manager {
           const running = e.status === "Running" || e.status === "running";
           if (running) this.matrixConnected.add(a.id);
           else this.matrixConnected.delete(a.id);
-          // Matrix connectivity cannot establish that the Agent runtime recovered.
-          if (a.desired && !(running && (a.status === "Error" || a.error)))
-            store.status(
-              a.id,
-              running
-                ? "Running"
-                : e.status === "Error" || e.status === "error"
-                  ? "Error"
-                  : "Stopped",
-              e.error ? this.error(e.error) : null,
-            );
+          const reconnect = this.matrixReconnectErrors.get(a.id);
+          const transportOnly = reconnect && a.status === "Stopped" && a.error === reconnect.error;
+          if (!a.desired || (!transportOnly && (a.status === "Error" || a.error))) {
+            // Transport updates must not replace or clear runtime, session, or delivery failures.
+            this.matrixReconnectErrors.delete(a.id);
+            return;
+          }
+          const error = e.error ? this.error(e.error) : null;
+          store.status(
+            a.id,
+            running ? "Running" : e.status === "Error" || e.status === "error" ? "Error" : "Stopped",
+            error,
+          );
+          // Only a transient transport failure is cleared by a later successful sync.
+          if (e.status === "reconnecting") this.matrixReconnectErrors.set(a.id, { error });
+          else this.matrixReconnectErrors.delete(a.id);
+          if (running && transportOnly)
+            void this.serial.run(a.id, async () => {
+              const current = store.agent(a.id);
+              if (this.closing || this.transitioning || !current.desired || current.status !== "Running") return;
+              if (await this.flush(a.id)) await this.process(a.id);
+            }).catch((error) => {
+              try { store.status(a.id, "Error", this.error(error)); } catch {}
+            });
         } catch {}
       }
     });
     gateway.on("crash", () => {
       this.matrixConnected.clear();
+      this.matrixReconnectErrors.clear();
       if (!this.closing && this.initialized) void this.recover();
     });
   }
@@ -247,7 +262,7 @@ export class Manager {
   }
   private error(e: unknown) {
     return this.runtimes.active.sanitizeError(this.pi.sanitizeError(
-      e instanceof Error ? e.message : "Operation failed.",
+      e instanceof Error ? e.message : typeof e === "string" ? e : "Operation failed.",
     ));
   }
   private checkTransition() {
@@ -340,6 +355,7 @@ export class Manager {
     this.checkTransition();
     return this.serial.run(id, async () => {
       this.store.checkVersion(id, version);
+      this.matrixReconnectErrors.delete(id);
       this.store.db
         .prepare("UPDATE agents SET desired=?,version=version+1 WHERE id=?")
         .run(op === "stop" ? 0 : 1, id);
@@ -357,6 +373,7 @@ export class Manager {
     this.checkTransition();
     await this.serial.run(id, async () => {
       this.store.checkVersion(id, version);
+      this.matrixReconnectErrors.delete(id);
       await Promise.all(Object.values(this.runtimes.adapters).map((runtime) => runtime.stopAgent(id)));
       await this.gateway.request("stop", { agent_id: id });
       this.matrixConnected.delete(id);

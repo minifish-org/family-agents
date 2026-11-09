@@ -23,7 +23,7 @@ import { ScheduleStore, type Schedule, type ScheduleScope, type ScheduleClaim } 
 import { applicationTools, familyToolInstructions, familyTimeZone } from "./app-tools.js";
 import type { RuntimeAgent, RuntimeReply } from "./runtime.js";
 
-type ManagerOptions = { now?: () => number; progressDelayMs?: number; scheduleIntervalMs?: number };
+type ManagerOptions = { now?: () => number; scheduleIntervalMs?: number };
 type ThreadReply = { thread_root_id: string; reply_to_event_id: string };
 type Processing = {
   room_id: string;
@@ -587,28 +587,35 @@ export class Manager {
   }
   private beginProcessing(id: string, run: Processing) {
     this.processing.set(id, run);
+    let stopped = false;
+    let pending: Promise<unknown> | undefined;
+    let stopping: Promise<void> | undefined;
     const typing = () => {
-      if (!this.closing && this.processing.get(id) === run && !run.controller.signal.aborted)
-        void this.gateway.request("set_typing", { agent_id: id, room_id: run.room_id, typing: true }, 2000).catch(() => {});
+      if (stopped || pending || this.closing || this.processing.get(id) !== run || run.controller.signal.aborted) return;
+      pending = this.gateway.request("set_typing", { agent_id: id, room_id: run.room_id, typing: true }, 3000)
+        .catch(() => {}).finally(() => { pending = undefined; });
     };
-    typing();
-    const refresh = setInterval(typing, 12_000);
+    const refresh = setInterval(typing, 8000);
     refresh.unref();
-    const progress = setTimeout(() => {
-      void (async () => {
-        if (this.closing || this.processing.get(id) !== run || run.controller.signal.aborted) return;
-        await this.validate(id, run.room_id);
-        if (this.closing || this.processing.get(id) !== run || run.controller.signal.aborted) return;
-        this.queueNotice(id, run.room_id, `${run.event_id}:progress`, "I'm still working on your reply. You can send 'cancel' to stop.", run.thread);
-        await this.flush(id);
-      })().catch(() => {});
-    }, this.options.progressDelayMs ?? 20_000);
-    progress.unref();
-    return () => {
-      clearInterval(refresh); clearTimeout(progress);
-      if (this.processing.get(id) === run) this.processing.delete(id);
-      void this.gateway.request("set_typing", { agent_id: id, room_id: run.room_id, typing: false }, 2000).catch(() => {});
+    const stop = () => {
+      if (stopping) return stopping;
+      stopped = true;
+      clearInterval(refresh);
+      run.controller.signal.removeEventListener("abort", abort);
+      stopping = (async () => {
+        try {
+          await pending;
+          await this.gateway.request("set_typing", { agent_id: id, room_id: run.room_id, typing: false }, 3000).catch(() => {});
+        } finally {
+          if (this.processing.get(id) === run) this.processing.delete(id);
+        }
+      })();
+      return stopping;
     };
+    const abort = () => { void stop(); };
+    run.controller.signal.addEventListener("abort", abort, { once: true });
+    typing();
+    return stop;
   }
   private queueReply(id: string, room: string, result: RuntimeReply,
     { thread, prefix, schedule }: { thread?: ThreadReply; prefix?: string; schedule?: Schedule } = {}) {
@@ -694,7 +701,7 @@ export class Manager {
     const run: Processing = {
       room_id: job.room_id, event_id: `scheduled:${claim.run_id}`, controller: new AbortController(),
     };
-    let stopFeedback: (() => void) | undefined;
+    let stopFeedback: (() => Promise<void>) | undefined;
     try {
       if (this.closing || this.transitioning || !this.currentScope(job)) throw new AppError(409, "The scheduled operation was stopped because its routing changed.");
       // Scheduled tasks keep the route of the owner's durable request, including across restarts.
@@ -714,11 +721,13 @@ export class Manager {
         result = await this.runtimes.active.run(this.runtimeAgent(this.store.agent(job.agent_id), run, false), this.store.settings(), prompt);
         if (!result.usedWebSearch || !result.text.trim()) throw new AppError(400, "Live sources could not be verified. This briefing is paused; cancel and recreate it after reconnecting native web search.");
       }
+      await stopFeedback?.();
       run.controller.signal.throwIfAborted();
       await this.validate(job.agent_id, job.room_id);
       if (this.closing || this.transitioning || !this.currentScope(job)) throw new AppError(409, "The scheduled operation was stopped because its routing changed.");
       this.schedules.complete(claim, (txn) => this.queueReply(job.agent_id, job.room_id, result, { thread: run.thread, prefix: txn, schedule: job }));
     } catch (error) {
+      await stopFeedback?.();
       const message = this.error(error).slice(0, 800);
       if (job.kind === "reminder") {
         // No outbox item was committed, so retrying this immutable reminder is safe.
@@ -730,7 +739,7 @@ export class Manager {
           this.queueNotice(job.agent_id, job.room_id, `${claim.run_id}:failed`, `Scheduled ${job.kind} paused: ${message}`, run.thread);
       });
     } finally {
-      stopFeedback?.();
+      await stopFeedback?.();
       await run.stopping;
     }
   }
@@ -740,7 +749,7 @@ export class Manager {
       const a = this.store.agent(id);
       if (!a.desired || a.status !== "Running" || this.closing || this.transitioning) return;
       let started = false;
-      let run: Processing | undefined, stopFeedback: (() => void) | undefined;
+      let run: Processing | undefined, stopFeedback: (() => Promise<void>) | undefined;
       try {
         await this.validate(id, item.room_id);
         if (this.closing || this.transitioning) return;
@@ -798,6 +807,7 @@ export class Manager {
               ]
             : [],
         );
+        await stopFeedback();
         run.controller.signal.throwIfAborted();
         this.store.transaction(() => {
           this.queueReply(id, item.room_id, result, { thread });
@@ -806,6 +816,7 @@ export class Manager {
         this.store.status(id, "Running");
         await this.flush(id);
       } catch (e) {
+        await stopFeedback?.();
         const message = run?.controller.signal.aborted ? "Reply cancelled. Previously saved schedules are unchanged." : this.error(e);
         if (started) this.store.transaction(() => {
           this.store.mark(id, item.event_id, "failed");
@@ -820,7 +831,7 @@ export class Manager {
         this.store.status(id, "Error", message);
         return;
       } finally {
-        stopFeedback?.();
+        await stopFeedback?.();
         await run?.stopping;
       }
     }

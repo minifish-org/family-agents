@@ -16,6 +16,7 @@ use matrix_sdk::{
             membership::get_member_events,
             profile::set_avatar_url,
             state::get_state_event_for_key,
+            typing::create_typing_event::v3::{self as create_typing_event, Typing, TypingInfo},
         },
         events::{
             AnyMessageLikeEvent, AnyTimelineEvent, GlobalAccountDataEventType, MessageLikeEvent,
@@ -61,6 +62,8 @@ const MAX_MEDIA: usize = 8 * 1024 * 1024;
 // Leave room in Matrix's 64 KiB event limit for encryption, base64 and event metadata.
 const MAX_FORMATTED_MESSAGE_BYTES: usize = 45 * 1024;
 const MAX_THREAD_ROOT_BODY_UNITS: usize = 4000;
+const TYPING_LIFETIME: Duration = Duration::from_secs(15);
+const TYPING_OPERATION_TIMEOUT: Duration = Duration::from_millis(1500);
 type Output = mpsc::Sender<Value>;
 type Accounts = Arc<Mutex<HashMap<String, Arc<Mutex<Account>>>>>;
 
@@ -1128,7 +1131,40 @@ fn markdown_message(text: &str) -> Result<RoomMessageEventContent> {
     Ok(RoomMessageEventContent::new(MessageType::Text(message)))
 }
 
+async fn send_typing_notice(client: &Client, room_id: OwnedRoomId, typing: bool) -> Result<()> {
+    let user_id = client
+        .user_id()
+        .context("Matrix client is not authenticated")?
+        .to_owned();
+    let state = if typing {
+        Typing::Yes(TypingInfo::new(TYPING_LIFETIME))
+    } else {
+        Typing::No
+    };
+    client
+        .send(create_typing_event::Request::new(user_id, room_id, state))
+        .with_request_config(
+            RequestConfig::new()
+                .disable_retry()
+                .timeout(Duration::from_secs(1)),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<Value> {
+    if request["op"] == "set_typing" {
+        return tokio::time::timeout(
+            TYPING_OPERATION_TIMEOUT,
+            command_inner(request, accounts, out),
+        )
+        .await
+        .context("Matrix typing operation timed out")?;
+    }
+    command_inner(request, accounts, out).await
+}
+
+async fn command_inner(request: &Value, accounts: &Accounts, out: &Output) -> Result<Value> {
     if request["v"] != 1 {
         bail!("Unsupported protocol version");
     }
@@ -1227,7 +1263,7 @@ async fn command(request: &Value, accounts: &Accounts, out: &Output) -> Result<V
                     .get("typing")
                     .and_then(Value::as_bool)
                     .context("Typing must be true or false")?;
-                room.typing_notice(typing).await?;
+                send_typing_notice(client, room_id, typing).await?;
                 return Ok(json!({}));
             }
             let txn = string(request, "txn_id")?;
@@ -1340,7 +1376,11 @@ async fn main() -> Result<()> {
                 Ok(result) => json!({"v":1,"id":id,"ok":true,"result":result}),
                 Err(error) => {
                     let message = error.to_string();
-                    if let Some(agent) = request["agent_id"].as_str() { emit_status(&out, agent, "error", Some(message.clone())); }
+                    if request["op"] != "set_typing"
+                        && let Some(agent) = request["agent_id"].as_str()
+                    {
+                        emit_status(&out, agent, "error", Some(message.clone()));
+                    }
                     json!({"v":1,"id":id,"ok":false,"error":{"code":"matrix_error","message":message}})
                 }
             };
@@ -1363,6 +1403,211 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn typing_fixture(
+        member_delay: Duration,
+    ) -> (
+        Accounts,
+        Output,
+        Arc<Mutex<Vec<Value>>>,
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicU16>,
+        JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let homeserver = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let unsafe_room = Arc::new(AtomicBool::new(false));
+        let typing_status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let observed = requests.clone();
+        let unsafe_members = unsafe_room.clone();
+        let response_status = typing_status.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                if stream.read_line(&mut first).await.unwrap() == 0 {
+                    continue;
+                }
+                let path = first.split_whitespace().nth(1).unwrap().to_owned();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    stream.read_line(&mut header).await.unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let owner = member("@owner:example.org", "join");
+                let bot = member("@bot:example.org", "join");
+                let state = |kind: &str, key: &str, content: Value| json!({"type":kind,"state_key":key,"content":content,"sender":"@owner:example.org","event_id":format!("${kind}{key}"),"origin_server_ts":1});
+                let mut status = 200;
+                let response = if path.contains("/typing/") {
+                    observed.lock().await.push(json!({
+                        "path":path, "body":serde_json::from_slice::<Value>(&body).unwrap(),
+                    }));
+                    status = response_status.load(Ordering::SeqCst);
+                    if status == 200 {
+                        json!({})
+                    } else {
+                        json!({"errcode":"M_UNKNOWN","error":"Temporary typing failure"})
+                    }
+                } else if path.contains("/sync?") {
+                    json!({"next_batch":"sync-1","rooms":{"join":{"!dm:example.org":{
+                        "state":{"events":[
+                            state("m.room.member", "@owner:example.org", json!({"membership":"join"})),
+                            state("m.room.member", "@bot:example.org", json!({"membership":"join"})),
+                            state("m.room.join_rules", "", json!({"join_rule":"invite"})),
+                            state("m.room.encryption", "", json!({"algorithm":"m.megolm.v1.aes-sha2"})),
+                        ]},"timeline":{"events":[],"limited":false,"prev_batch":"sync-0"},
+                        "ephemeral":{"events":[]},"account_data":{"events":[]},
+                    }}}})
+                } else if path.contains("/members") {
+                    tokio::time::sleep(member_delay).await;
+                    let mut members = vec![owner, bot];
+                    if unsafe_members.load(Ordering::SeqCst) {
+                        members.push(member("@other:example.org", "join"));
+                    }
+                    json!({"chunk":members})
+                } else if path.contains("/state/m.room.join_rules") {
+                    json!({"join_rule":"invite"})
+                } else if path.contains("/account_data/m.direct") {
+                    json!({"@owner:example.org":["!dm:example.org"]})
+                } else if path.contains("/keys/upload") {
+                    json!({"one_time_key_counts":{}})
+                } else if path.contains("/keys/query") {
+                    json!({"device_keys":{},"failures":{}})
+                } else {
+                    json!({})
+                };
+                let body = response.to_string();
+                let header = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.get_mut().write_all(header.as_bytes()).await.is_ok() {
+                    let _ = stream.get_mut().write_all(body.as_bytes()).await;
+                }
+            }
+        });
+        let client = Client::builder()
+            .homeserver_url(&homeserver)
+            .server_versions([matrix_sdk::ruma::api::MatrixVersion::V1_1])
+            .build()
+            .await
+            .unwrap();
+        client
+            .matrix_auth()
+            .restore_session(
+                serde_json::from_value(json!({
+                    "user_id":"@bot:example.org","device_id":"TEST",
+                    "access_token":"typing-test-token",
+                }))
+                .unwrap(),
+                RoomLoadSettings::default(),
+            )
+            .await
+            .unwrap();
+        client.sync_once(SyncSettings::new()).await.unwrap();
+        let mut account = Account::new();
+        account.client = Some(client);
+        account.config = Some(Start {
+            agent_id: "typing-test".into(),
+            homeserver,
+            matrix_id: "@bot:example.org".into(),
+            owner_id: "@owner:example.org".into(),
+            password: String::new(),
+            store_path: PathBuf::new(),
+            display_name: None,
+            avatar: AvatarUpdate::Preserve,
+        });
+        let accounts = Arc::new(Mutex::new(HashMap::from([(
+            "typing-test".into(),
+            Arc::new(Mutex::new(account)),
+        )])));
+        let (out, _) = mpsc::channel(8);
+        (accounts, out, requests, unsafe_room, typing_status, server)
+    }
+
+    #[tokio::test]
+    async fn typing_stop_always_reaches_the_server_and_every_send_rechecks_owner_membership() {
+        let (accounts, out, requests, unsafe_room, status, server) =
+            typing_fixture(Duration::ZERO).await;
+        let request = |typing| json!({"v":1,"op":"set_typing","agent_id":"typing-test","room_id":"!dm:example.org","typing":typing});
+        command(&request(false), &accounts, &out).await.unwrap();
+        command(&request(true), &accounts, &out).await.unwrap();
+        // The SDK's old local typing timestamp expired after four seconds and skipped this stop.
+        tokio::time::sleep(Duration::from_millis(4100)).await;
+        command(&request(false), &accounts, &out).await.unwrap();
+        let observed = requests.lock().await.clone();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0]["body"], json!({"typing":false}));
+        assert_eq!(observed[1]["body"], json!({"typing":true,"timeout":15000}));
+        assert_eq!(observed[2]["body"], json!({"typing":false}));
+        assert!(observed.iter().all(|r| {
+            r["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/typing/@bot:example.org")
+        }));
+        unsafe_room.store(true, Ordering::SeqCst);
+        for typing in [true, false] {
+            assert!(command(&request(typing), &accounts, &out).await.is_err());
+        }
+        assert_eq!(requests.lock().await.len(), 3);
+        unsafe_room.store(false, Ordering::SeqCst);
+        status.store(503, Ordering::SeqCst);
+        assert!(command(&request(true), &accounts, &out).await.is_err());
+        assert_eq!(
+            requests.lock().await.len(),
+            4,
+            "Typing requests must not retry"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_typing_validation_does_not_send_a_late_active_notice() {
+        let (accounts, out, requests, _, _, server) = typing_fixture(Duration::from_secs(2)).await;
+        let request = json!({"v":1,"op":"set_typing","agent_id":"typing-test","room_id":"!dm:example.org","typing":true});
+        let error = command(&request, &accounts, &out).await.unwrap_err();
+        assert!(error.to_string().contains("typing operation timed out"));
+        // Allow the server's outstanding membership response to finish after cancellation.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            requests.lock().await.is_empty(),
+            "Expired work must not later activate typing"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_typing_expires_while_waiting_for_the_agent_lock() {
+        let accounts: Accounts = Arc::new(Mutex::new(HashMap::new()));
+        let account = Arc::new(Mutex::new(Account::new()));
+        accounts
+            .lock()
+            .await
+            .insert("typing-test".into(), account.clone());
+        let _held = account.lock().await;
+        let (out, _) = mpsc::channel(8);
+        let request = json!({"v":1,"op":"set_typing","agent_id":"typing-test","room_id":"!dm:example.org","typing":true});
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), command(&request, &accounts, &out))
+                .await
+                .expect("Expired typing must not remain queued after the caller times out")
+                .unwrap_err();
+        assert!(error.to_string().contains("typing operation timed out"));
+    }
 
     #[test]
     fn threaded_sends_preserve_root_and_owner_reply_target() {

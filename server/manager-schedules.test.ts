@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { Store } from "./store.js";
 import { Manager } from "./manager.js";
 import { RuntimeManager } from "./runtime-manager.js";
@@ -64,7 +65,7 @@ function fixture(existing?: { dir: string; now: { value: number } }) {
   } else store.status("a", "Running");
   const runtime = new ScheduledRuntime(), gateway = new ScheduledGateway();
   const manager = new Manager(store, { sanitizeError: runtime.sanitizeError } as any, gateway as any,
-    new RuntimeManager({ pi: new ScheduledRuntime(), codex: runtime }, "codex"), { now: () => now.value, progressDelayMs: 60_000 });
+    new RuntimeManager({ pi: new ScheduledRuntime(), codex: runtime }, "codex"), { now: () => now.value });
   const scope: ScheduleScope = {
     agent_id: "a", room_id: "!dm:example.org", homeserver: "https://matrix.example.org",
     agent_matrix_id: "@bot:example.org", owner_matrix_id: "@owner:example.org",
@@ -80,6 +81,38 @@ function fixture(existing?: { dir: string; now: { value: number } }) {
   };
 }
 
+test("briefings finish typing cleanup before publishing a result or failure", async () => {
+  for (const fail of [false, true]) {
+    const f = fixture();
+    let finishStop!: () => void;
+    const pendingStop = new Promise<void>((resolve) => { finishStop = resolve; });
+    const request = f.gateway.request.bind(f.gateway);
+    let stopping = false, completed = false;
+    f.gateway.request = async (op, args) => {
+      const response = await request(op, args);
+      if (op === "set_typing" && !args.typing) { stopping = true; await pendingStop; }
+      return response;
+    };
+    if (fail) f.runtime.onRun = async () => { throw new Error("The briefing provider failed."); };
+    const schedule = f.briefing();
+    f.now.value += 60_000;
+    const polling = f.manager.pollScheduled().then(() => { completed = true; });
+    try {
+      for (let index = 0; index < 150 && !stopping; index++) await delay(2);
+      assert.equal(stopping, true);
+      assert.equal(completed, false, "The scheduled run retains its queue until typing stops.");
+      assert.equal(f.gateway.sent().length, 0);
+      assert.equal(f.store.outbox("a").length, 0);
+      finishStop();
+      await polling;
+      assert.deepEqual(f.gateway.calls.filter((call) => call.op === "set_typing").map((call) => call.args.typing), [true, false]);
+      assert.equal(f.gateway.sent().length, 1);
+      assert.match(f.gateway.sent()[0].args.text, fail ? /briefing provider failed/ : /Verified news/);
+      assert.equal(f.manager.schedules.get(f.scope, schedule.id)!.state, fail ? "needs_attention" : "pending");
+    } finally { finishStop(); await polling; await f.close(); }
+  }
+});
+
 test("due reminders do not call a model and retry delivery with the same transaction after restart", async () => {
   let f = fixture();
   try {
@@ -88,6 +121,7 @@ test("due reminders do not call a model and retry delivery with the same transac
     f.gateway.failSend = true;
     await f.manager.pollScheduled();
     assert.equal(f.runtime.runs.length, 0);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "set_typing").length, 0);
     assert.equal(f.manager.schedules.get(f.scope, schedule.id)!.state, "done");
     const first = f.gateway.sent()[0];
     assert.match(first.args.text, /Reminder 1/);
@@ -102,6 +136,7 @@ test("due reminders do not call a model and retry delivery with the same transac
     assert.equal(f.gateway.sent().length, 1);
     assert.equal(f.gateway.sent()[0].args.txn_id, first.args.txn_id);
     assert.equal(f.runtime.runs.length, 0);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "set_typing").length, 0);
     assert.equal(f.store.outbox("a").length, 0);
     await f.manager.pollScheduled();
     assert.equal(f.gateway.sent().length, 1);

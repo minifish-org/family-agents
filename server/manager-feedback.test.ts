@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate as nextTurn, setTimeout as delay } from "node:timers/promises";
 import { Manager } from "./manager.js";
 import { RuntimeManager } from "./runtime-manager.js";
 import { Store } from "./store.js";
@@ -15,7 +15,7 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-function fixture(progressDelayMs = 10_000) {
+function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "family-manager-feedback-"));
   const store = new Store(directory), owner = store.addPerson("@owner:example.org", "Owner");
   store.db.prepare("INSERT INTO agents(id,person_id,matrix_id,display_name,status) VALUES('a',?,'@bot:example.org','Bot','Running')").run(owner.id);
@@ -42,7 +42,7 @@ function fixture(progressDelayMs = 10_000) {
   });
   const other: AgentRuntime = { ...adapter, close: async () => {} };
   const manager = new Manager(store, { ready: Promise.resolve(), sanitizeError } as any, gateway as any,
-    new RuntimeManager({ pi: adapter, codex: other }), { progressDelayMs });
+    new RuntimeManager({ pi: adapter, codex: other }));
   const event = (event_id = "$one", body = "Please help") => ({
     agent_id: "a", event_id, room_id: "!dm:example.org", sender: owner.matrix_id, body,
     is_direct: true, members: [owner.matrix_id, "@bot:example.org"],
@@ -53,6 +53,9 @@ function fixture(progressDelayMs = 10_000) {
 async function until(check: () => boolean) {
   for (let index = 0; index < 150; index++) { if (check()) return; await delay(2); }
   assert.fail("The expected Manager operation did not arrive.");
+}
+async function settle() {
+  await nextTurn();
 }
 const csv = { data: Buffer.from('\uFEFF"Item","Amount"\r\n"Food",42\r\n').toString("base64"), mimeType: "text/csv", name: "家庭预算.csv" };
 const png = { data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aAnkAAAAASUVORK5CYII=", mimeType: "image/png" };
@@ -96,31 +99,248 @@ test("threaded owner turns use stable, distinct conversation keys and return tex
   } finally { await f.close(); }
 });
 
-test("a slow reply sends one durable progress notice and stops typing after the final answer", async () => {
-  const f = fixture(1), result = deferred<RuntimeReply>();
+test("a slow reply stays silent until the final answer and stops typing before delivery", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const f = fixture(), result = deferred<RuntimeReply>();
   const event = { ...f.event(), thread_root_id: "$budget" };
   f.adapter.run = async () => { f.calls.runs++; return result.promise; };
   let receiving: Promise<void> | undefined;
   try {
     receiving = f.manager.receive(event);
-    await until(() => f.gateway.calls.some((call) => call.op === "send_message" && /still working/.test(call.args.text)));
-    const progress = f.gateway.calls.find((call) => call.op === "send_message")!;
-    assert.match(progress.args.text, /cancel/);
-    assert.match(progress.args.txn_id, /^notice-/);
-    assert.equal(progress.args.markdown, undefined);
-    assert.equal(progress.args.thread_root_id, "$budget");
-    assert.equal(progress.args.reply_to_event_id, "$one");
+    await settle();
+    assert.equal(f.calls.runs, 1);
+    t.mock.timers.tick(24_001);
+    await settle();
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    assert.equal(f.store.outbox("a").length, 0);
     assert.equal(f.gateway.calls.filter((call) => call.op === "set_typing" && !call.args.typing).length, 0);
     result.resolve({ text: "**Finished the analysis**", images: [] });
     await receiving;
     await f.manager.receive(event);
     assert.equal(f.calls.runs, 1);
-    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message" && /still working/.test(call.args.text)).length, 1);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 1);
     const replies = f.gateway.calls.filter((call) => call.op === "send_message" && call.args.text === "**Finished the analysis**");
     assert.equal(replies.length, 1);
     assert.equal(replies[0].args.markdown, true);
+    assert.equal(replies[0].args.thread_root_id, "$budget");
+    assert.equal(replies[0].args.reply_to_event_id, "$one");
     assert.equal(f.gateway.calls.filter((call) => call.op === "set_typing").at(-1)!.args.typing, false);
-  } finally { result.resolve({ text: "Closed", images: [] }); await receiving; await f.close(); }
+    assert.ok(f.gateway.calls.findIndex((call) => call.op === "set_typing" && !call.args.typing) < f.gateway.calls.indexOf(replies[0]));
+  } finally { t.mock.timers.reset(); result.resolve({ text: "Closed", images: [] }); await receiving; await f.close(); }
+});
+
+test("typing cleanup drains a delayed start and finishes before delivery or the next queued turn", async () => {
+  const f = fixture(), first = deferred<RuntimeReply>(), start = deferred<void>(), stop = deferred<void>();
+  const request = f.gateway.request.bind(f.gateway), completed: boolean[] = [];
+  let starts = 0, stops = 0;
+  f.gateway.request = async (op, args) => {
+    const result = await request(op, args);
+    if (op === "set_typing") {
+      if (args.typing && ++starts === 1) await start.promise;
+      if (!args.typing && ++stops === 1) await stop.promise;
+      completed.push(args.typing);
+    }
+    return result;
+  };
+  f.adapter.run = async () => ++f.calls.runs === 1 ? first.promise : { text: "Second", images: [] };
+  const receiving = [f.manager.receive(f.event("$first"))];
+  try {
+    await until(() => f.calls.runs === 1);
+    receiving.push(f.manager.receive(f.event("$second")));
+    await until(() => f.gateway.calls.some(({ op, args }) => op === "ack_event" && args.event_id === "$second"));
+    first.resolve({ text: "First", images: [] });
+    await settle();
+    assert.equal(stops, 0, "The final stop waits for the in-flight start.");
+    assert.equal(f.calls.runs, 1);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    start.resolve();
+    await until(() => stops === 1);
+    assert.equal(f.calls.runs, 1, "The next turn waits for the preceding stop acknowledgement.");
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    stop.resolve();
+    await Promise.all(receiving);
+    assert.deepEqual(completed, [true, false, true, false]);
+    assert.deepEqual(f.gateway.calls.filter((call) => call.op === "send_message").map((call) => call.args.text), ["First", "Second"]);
+  } finally {
+    first.resolve({ text: "", images: [] }); start.resolve(); stop.resolve();
+    await Promise.allSettled(receiving); await f.close();
+  }
+});
+
+test("typing refreshes coalesce while pending and cannot restart typing after completion", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const f = fixture(), result = deferred<RuntimeReply>(), initial = deferred<void>(), refresh = deferred<void>();
+  const request = f.gateway.request.bind(f.gateway);
+  let starts = 0;
+  f.gateway.request = async (op, args) => {
+    const response = await request(op, args);
+    if (op === "set_typing" && args.typing) await (++starts === 1 ? initial.promise : refresh.promise);
+    return response;
+  };
+  f.adapter.run = async () => { f.calls.runs++; return result.promise; };
+  const receiving = f.manager.receive(f.event());
+  try {
+    await settle();
+    assert.equal(starts, 1);
+    t.mock.timers.tick(40_000);
+    await settle();
+    assert.equal(starts, 1, "Refresh ticks cannot overlap an outstanding typing request.");
+    initial.resolve();
+    await settle();
+    t.mock.timers.tick(8000);
+    await settle();
+    assert.equal(starts, 2);
+    result.resolve({ text: "Finished", images: [] });
+    await settle();
+    t.mock.timers.tick(40_000);
+    await settle();
+    assert.equal(starts, 2);
+    assert.equal(f.gateway.calls.filter(({ op, args }) => op === "set_typing" && !args.typing).length, 0);
+    refresh.resolve();
+    await receiving;
+    const typing = f.gateway.calls.filter((call) => call.op === "set_typing");
+    assert.deepEqual(typing.map((call) => call.args.typing), [true, true, false]);
+    t.mock.timers.tick(60_000);
+    await settle();
+    assert.equal(f.gateway.calls.filter((call) => call.op === "set_typing").length, typing.length);
+  } finally {
+    t.mock.timers.reset(); initial.resolve(); refresh.resolve(); result.resolve({ text: "", images: [] });
+    await receiving; await f.close();
+  }
+});
+
+test("a model failure waits for typing cleanup before delivering its error", async () => {
+  const f = fixture(), stop = deferred<void>();
+  const request = f.gateway.request.bind(f.gateway);
+  let stopping = false;
+  f.gateway.request = async (op, args) => {
+    const response = await request(op, args);
+    if (op === "set_typing" && !args.typing) { stopping = true; await stop.promise; }
+    return response;
+  };
+  f.adapter.run = async () => { throw new Error("The model is unavailable."); };
+  const receiving = f.manager.receive(f.event());
+  try {
+    await until(() => stopping);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    stop.resolve();
+    await receiving;
+    assert.equal(f.gateway.calls.filter((call) => call.op === "set_typing" && !call.args.typing).length, 1);
+    assert.match(f.gateway.calls.find((call) => call.op === "send_message")!.args.text, /model is unavailable/);
+  } finally { stop.resolve(); await receiving; await f.close(); }
+});
+
+test("cancellation stops typing before the model acknowledges interruption", async () => {
+  const f = fixture(), result = deferred<RuntimeReply>(), stopped = deferred<void>();
+  f.adapter.run = async () => { f.calls.runs++; return result.promise; };
+  f.adapter.stopAgent = async () => { f.calls.stops++; await stopped.promise; result.reject(new Error("Interrupted")); };
+  const receiving = f.manager.receive(f.event());
+  let cancelling: Promise<void> | undefined;
+  try {
+    await until(() => f.calls.runs === 1);
+    cancelling = f.manager.receive(f.event("$cancel", "取消"));
+    await until(() => f.calls.stops === 1);
+    await until(() => f.gateway.calls.some(({ op, args }) => op === "set_typing" && !args.typing));
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    stopped.resolve();
+    await Promise.all([receiving, cancelling]);
+    assert.equal(f.gateway.calls.filter(({ op, args }) => op === "set_typing" && !args.typing).length, 1);
+    assert.match(f.gateway.calls.find((call) => call.op === "send_message")!.args.text, /Reply cancelled/);
+  } finally { stopped.resolve(); result.resolve({ text: "", images: [] }); await Promise.allSettled([receiving, cancelling]); await f.close(); }
+});
+
+test("a completed model reply remains cancellable while typing cleanup is pending", async () => {
+  const f = fixture(), stop = deferred<void>();
+  const request = f.gateway.request.bind(f.gateway);
+  let stopping = false;
+  f.gateway.request = async (op, args) => {
+    const response = await request(op, args);
+    if (op === "set_typing" && !args.typing) { stopping = true; await stop.promise; }
+    return response;
+  };
+  const receiving = f.manager.receive(f.event());
+  let cancelling: Promise<void> | undefined;
+  try {
+    await until(() => stopping);
+    assert.equal(f.calls.runs, 1);
+    cancelling = f.manager.receive(f.event("$cancel", "cancel"));
+    await until(() => f.calls.stops === 1);
+    stop.resolve();
+    await Promise.all([receiving, cancelling]);
+    assert.equal(f.store.db.prepare("SELECT state FROM inbox WHERE event_id='$one'").get()!.state, "failed");
+    const sent = f.gateway.calls.filter((call) => call.op === "send_message");
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].args.text, /Reply cancelled/);
+    assert.equal(f.gateway.calls.filter(({ op, args }) => op === "set_typing" && !args.typing).length, 1);
+  } finally { stop.resolve(); await Promise.allSettled([receiving, cancelling]); await f.close(); }
+});
+
+test("shutdown aborts a completed model reply while typing cleanup is pending", async () => {
+  const f = fixture(), stop = deferred<void>();
+  const request = f.gateway.request.bind(f.gateway);
+  let stopping = false, gatewayClosed = false;
+  f.gateway.request = async (op, args) => {
+    const response = await request(op, args);
+    if (op === "set_typing" && !args.typing) { stopping = true; await stop.promise; }
+    return response;
+  };
+  f.gateway.close = async () => { gatewayClosed = true; };
+  const receiving = f.manager.receive(f.event());
+  let closing: Promise<void> | undefined;
+  try {
+    await until(() => stopping);
+    assert.equal(f.calls.runs, 1);
+    closing = f.manager.close();
+    await settle();
+    assert.equal(gatewayClosed, false);
+    stop.resolve();
+    await Promise.all([receiving, closing]);
+    assert.equal(gatewayClosed, true);
+    assert.equal(f.gateway.calls.filter((call) => call.op === "send_message").length, 0);
+    assert.equal(f.gateway.calls.filter(({ op, args }) => op === "set_typing" && !args.typing).length, 1);
+  } finally {
+    stop.resolve(); await Promise.allSettled([receiving, closing]);
+    if (closing) rmSync(f.directory, { recursive: true, force: true });
+    else await f.close();
+  }
+});
+
+test("shutdown waits for pending typing cleanup before closing the Gateway", async () => {
+  const f = fixture(), result = deferred<RuntimeReply>(), start = deferred<void>(), stop = deferred<void>();
+  const request = f.gateway.request.bind(f.gateway);
+  let stopping = false, gatewayClosed = false;
+  f.gateway.request = async (op, args) => {
+    const response = await request(op, args);
+    if (op === "set_typing") {
+      if (args.typing) await start.promise;
+      else { stopping = true; await stop.promise; }
+    }
+    return response;
+  };
+  f.gateway.close = async () => { gatewayClosed = true; };
+  f.adapter.run = async () => { f.calls.runs++; return result.promise; };
+  f.adapter.close = async () => { result.reject(new Error("Service stopped.")); };
+  const receiving = f.manager.receive(f.event());
+  let closing: Promise<void> | undefined;
+  try {
+    await until(() => f.calls.runs === 1);
+    closing = f.manager.close();
+    await settle();
+    assert.equal(stopping, false);
+    assert.equal(gatewayClosed, false);
+    start.resolve();
+    await until(() => stopping);
+    assert.equal(gatewayClosed, false);
+    stop.resolve();
+    await Promise.all([receiving, closing]);
+    assert.equal(gatewayClosed, true);
+    assert.deepEqual(f.gateway.calls.filter((call) => call.op === "set_typing").map((call) => call.args.typing), [true, false]);
+  } finally {
+    start.resolve(); stop.resolve(); result.resolve({ text: "", images: [] });
+    await Promise.allSettled([receiving, closing]);
+    if (closing) rmSync(f.directory, { recursive: true, force: true });
+    else await f.close();
+  }
 });
 
 test("model failure queues sanitized owner feedback with a stable delivery transaction and never reruns the failed prompt", async () => {

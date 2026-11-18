@@ -7,4 +7,5 @@ export HOST=127.0.0.1
 export PORT=18090
 export FAMILY_TIME_ZONE="${FAMILY_TIME_ZONE:-Asia/Singapore}"
 export FAMILY_PYTHON_BIN="${FAMILY_PYTHON_BIN:-/config/.local/opt/family-agents-python/bin/python3}"
-exec /command/s6-setuidgid abc /config/.local/bin/node dist/server/index.js
+export CODEX_BIN="${CODEX_BIN:-/config/.local/opt/codex-0.170.0/bin/codex}"
+exec /command/s6-setuidgid abc /config/.local/opt/dev-tools/node-24.22.3/bin/node dist/server/index.js

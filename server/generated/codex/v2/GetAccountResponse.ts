@@ -4,4 +4,8 @@
 import type { Account } from "./Account.js";
 import type { WorkspaceRouting } from "./WorkspaceRouting.js";
 
-export type GetAccountResponse = { account: Account | null, requiresOpenaiAuth: boolean, workspaceRouting: WorkspaceRouting | null, };
+export type GetAccountResponse = { account: Account | null,
+/**
+ * ChatGPT user ID belonging to this account response, when available.
+ */
+userId: string | null, requiresOpenaiAuth: boolean, workspaceRouting: WorkspaceRouting | null, };

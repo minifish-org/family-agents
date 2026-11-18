@@ -9,6 +9,7 @@ type Pending = {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
+  resumeProvider?: string;
 };
 type Options = {
   binary?: string;
@@ -182,13 +183,16 @@ export class CodexClient extends EventEmitter {
     const child = this.child;
     if (!child) return Promise.reject(new Error("Codex App Server is disconnected."));
     const id = this.nextId++;
+    const resumeProvider = method === "thread/resume" && params && typeof params === "object"
+      && "modelProvider" in params && typeof params.modelProvider === "string"
+      ? params.modelProvider : undefined;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         // A timed-out request may already have executed. Tear down the connection; never replay it.
         this.fail(child, new Error("Codex App Server request timed out. The operation was not retried."));
       }, this.options.requestTimeoutMs ?? 30_000);
       timer.unref();
-      this.pending.set(id, { resolve: (value) => resolve(value as T), reject, timer });
+      this.pending.set(id, { resolve: (value) => resolve(value as T), reject, timer, resumeProvider });
       try {
         this.write(child, { id, method, params });
       } catch {
@@ -215,10 +219,16 @@ export class CodexClient extends EventEmitter {
     if (message.error) {
       // Do not expose arbitrary native/provider error bodies containing credentials or reasoning.
       const error = new Error("Codex App Server rejected the request. Check its authentication and selected model.");
+      // Codex 0.170 reports the provider mismatch as a configuration error on resume.
+      const nativeMessage = message.error.message;
+      const mismatch = pending.resumeProvider && message.error.code === -32600 && typeof nativeMessage === "string"
+        ? /^failed to load configuration: Cannot change this thread's model provider from `([^`]+)` to `([^`]+)` on resume\.$/.exec(nativeMessage)
+        : null;
+      const providerMismatch = message.error.data?.type === "modelProviderMismatch"
+        || (mismatch && mismatch[1] !== mismatch[2] && mismatch[2] === pending.resumeProvider);
       Object.assign(error, {
         code: message.error.code,
-        // Preserve only this documented discriminator, never arbitrary error data.
-        ...(message.error.data?.type === "modelProviderMismatch" ? { reason: "modelProviderMismatch" } : {}),
+        ...(providerMismatch ? { reason: "modelProviderMismatch" } : {}),
       });
       pending.reject(error);
     } else pending.resolve(message.result);

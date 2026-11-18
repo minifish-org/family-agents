@@ -46,10 +46,11 @@ test("reminders persist exact deadlines and local confirmations with idempotent 
 test("schedule input validation rejects ambiguous, invalid, past, oversized, and excessive requests", () => {
   const f = fixture();
   try {
+    assert.throws(() => f.schedules.createReminder(owner, { text: "Reminder" }, request(1)), /Ask the owner for a clock time or delay/);
     for (const values of [
       { at: "2026-11-07T19:00:00" }, { at: "2027-02-30T19:00:00+08:00" }, { at: "2026-11-07T25:00:00Z" },
       { at: "2026-11-05T19:00:00Z" }, { at: "2030-11-07T19:00:00Z" }, { delay_seconds: 0 }, { delay_seconds: 1.5 },
-      { delay_seconds: 365 * 86400 + 1 }, {}, { delay_seconds: 1, at: "2026-11-07T19:00:00Z" },
+      { delay_seconds: 365 * 86400 + 1 }, { delay_seconds: 1, at: "2026-11-07T19:00:00Z" },
     ]) assert.throws(() => f.schedules.createReminder(owner, { text: "Reminder", ...values }, request(1)));
     assert.throws(() => f.schedules.createReminder(owner, { text: "Reminder", delay_seconds: 1, time_zone: "CST" }, request(1)), /IANA/);
     assert.throws(() => f.schedules.createReminder(owner, { text: "Reminder", delay_seconds: 1, time_zone: "Invalid/Place" }, request(1)), /IANA/);

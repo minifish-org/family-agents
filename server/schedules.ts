@@ -72,7 +72,7 @@ function localDay(instant: number, zone: string) {
   return Date.UTC(p.year, p.month - 1, p.day);
 }
 
-function localDisplay(instant: number, zone: string) {
+export function scheduleLocalTime(instant: number, zone: string) {
   const p = localParts(instant, zone), pad = (n: number) => String(n).padStart(2, "0");
   return `${p.year}-${pad(p.month)}-${pad(p.day)} ${pad(p.hour)}:${pad(p.minute)} ${zone}`;
 }
@@ -179,7 +179,7 @@ export class ScheduleStore {
     if (!row) return null;
     const value = row as StoredSchedule;
     const { source_event_id: _, call_id: __, request_hash: ___, ...publicValue } = value;
-    return { ...publicValue, next_run_local: localDisplay(value.next_run, value.time_zone) };
+    return { ...publicValue, next_run_local: scheduleLocalTime(value.next_run, value.time_zone) };
   }
 
   get(scope: ScheduleScope, id: string): Schedule | null {
@@ -213,7 +213,10 @@ export class ScheduleStore {
 
   createReminder(scope: ScheduleScope, input: { text: string; time_zone?: string; at?: string; delay_seconds?: number }, request: ScheduleRequest): Schedule {
     const text = required(input.text, "Reminder text", 2048), zone = timeZone(input.time_zone ?? this.defaultTimeZone), now = this.now();
-    if ((input.at !== undefined) === (input.delay_seconds !== undefined)) throw new AppError(400, "Choose exactly one absolute reminder time or delay in seconds.");
+    if (input.at === undefined && input.delay_seconds === undefined)
+      throw new AppError(400, "Ask the owner for a clock time or delay before saving this reminder.");
+    if (input.at !== undefined && input.delay_seconds !== undefined)
+      throw new AppError(400, "Choose exactly one absolute reminder time or delay in seconds.");
     let next: number;
     if (input.delay_seconds !== undefined) {
       if (!Number.isInteger(input.delay_seconds) || input.delay_seconds < 1 || input.delay_seconds > YEAR / 1000)

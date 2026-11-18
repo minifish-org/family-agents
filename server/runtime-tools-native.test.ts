@@ -74,10 +74,14 @@ test("native application tools upgrade existing history, rotate run capabilities
   try {
     await runtime.run({ id: "a" }, defaults, "ORIGINAL HISTORY PROOF");
     const original = mapping().threadId;
-    const first = await runtime.run({ id: "a", tools: tools("A") }, defaults, "TOOL A1");
+    const currentGuidance = "Current application reminder guidance fixture";
+    const first = await runtime.run({ id: "a", tools: { ...tools("A"), instructions: currentGuidance } }, defaults, "TOOL A1");
     assert.equal(first.files?.[0].name, "A.csv");
     assert.equal(mapping().threadId, original, "application tool setup must preserve the original native thread");
     assert.equal(requests.length, 3, "upgrading tools must not replay a model turn");
+    assert.ok(requests[1].input.some((item: any) => item.type === "message" && item.role === "developer"
+      && item.content.some((part: any) => part.text?.includes(currentGuidance))),
+    "resumed native history must receive current application instructions as a developer message");
     const retired = configurations.at(-1);
     const late = await fetch(retired.url, { method: "POST", headers: retired.http_headers,
       body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/call", params: { name: "export_file", arguments: { format: "csv" } } }) });

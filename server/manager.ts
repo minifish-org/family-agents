@@ -565,8 +565,8 @@ export class Manager {
     } : undefined);
     return {
       id: agent.id, conversationId, initialContext: run?.initialContext,
-      instructions: [agent.instructions, familyToolInstructions()].filter(Boolean).join("\n\n"),
-      tools: { definitions: tools.definitions, execute: (name, args, context) => tools.execute(name, args, {
+      instructions: agent.instructions,
+      tools: { instructions: familyToolInstructions(this.options.now?.()), definitions: tools.definitions, execute: (name, args, context) => tools.execute(name, args, {
         ...context, signal: run ? AbortSignal.any([context.signal, run.controller.signal]) : context.signal,
       }) },
     };

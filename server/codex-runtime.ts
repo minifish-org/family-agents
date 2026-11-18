@@ -816,6 +816,15 @@ export class CodexRuntime implements AgentRuntime {
           threadId: session.threadId, model: defaults.model, cwd: session.cwd,
           approvalPolicy: "on-request", permissions: "family_agent",
           effort: levels.includes(defaults.thinking_level) ? defaults.thinking_level : levels.includes(model.defaultReasoningEffort) ? model.defaultReasoningEffort : levels[0] ?? null,
+          // A resumed native thread can retain its original developer instructions.
+          // Send current application guidance separately from the owner's message.
+          additionalContext: toolLease ? {
+            family_agents_current: { kind: "application", value: [
+              "Use the latest Family Agents application guidance and clock for this turn. Older guidance and clock values belong to their original turns.",
+              "When using functions.exec, find the exact application tool schema in ALL_TOOLS and call tools.mcp__family_app__<tool_name>(args). Finding a tool is not the same as calling it.",
+              agent.tools?.instructions,
+            ].filter(Boolean).join("\n\n") },
+          } : undefined,
           input: [
             { type: "text", text: initialContext ? `${initialContext}\n\n${message}` : message, text_elements: [] },
             ...images.map((image) => ({ type: "image" as const, url: `data:${image.mimeType};base64,${image.data}` })),

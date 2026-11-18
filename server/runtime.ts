@@ -31,6 +31,8 @@ export interface RuntimeToolResult {
 }
 /** The application captures owner, room and message identity in this per-run closure. */
 export interface RuntimeTools {
+  /** Current application guidance, separate from the Agent's persistent instructions. */
+  instructions?: string;
   definitions: RuntimeToolDefinition[];
   execute(name: string, args: unknown, context: { callId: string; signal: AbortSignal }): Promise<RuntimeToolResult>;
 }
